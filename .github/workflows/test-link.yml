@@ -42,30 +42,35 @@ jobs:
           SONG: ${{ github.event.inputs.song }}
           LIMIT: ${{ github.event.inputs.limit }}
         run: |
-          mkdir -p search-results
+          mkdir -p "search-results/$ARTIST"
           
           QUERY="$ARTIST $SONG"
           
           echo "🔍 Searching: $QUERY"
           echo ""
           
-          # yt-dlp flat search (no download, just metadata)
+          # Search with yt-dlp (get full info)
           yt-dlp \
-            --flat-playlist \
             --dump-json \
             --no-download \
             --no-check-certificate \
             --default-search "scsearch" \
             --max-downloads "$LIMIT" \
-            "$QUERY" > search-results/raw.json 2>&1
+            "$QUERY" > "search-results/$ARTIST/raw.json" 2>/dev/null
           
-          # Parse results
+          # Parse and create beautiful README.md
           python3 << 'PYEOF'
-          import json, os
+          import json, os, datetime
 
-          input_file = 'search-results/raw.json'
+          artist = os.environ['ARTIST']
+          song = os.environ.get('SONG', '')
+          query = f"{artist} {song}".strip()
+          base_dir = f"search-results/{artist}"
+          
+          input_file = f"{base_dir}/raw.json"
           if not os.path.exists(input_file):
-              print("No results file")
+              with open(f"{base_dir}/README.md", 'w', encoding='utf-8') as f:
+                  f.write(f"# 🔍 {query}\n\n❌ No results found.\n")
               exit()
 
           with open(input_file) as f:
@@ -75,79 +80,177 @@ jobs:
           for line in content.split('\n'):
               if line.startswith('{'):
                   try:
-                      track = json.loads(line)
-                      tracks.append(track)
+                      tracks.append(json.loads(line))
                   except:
                       pass
 
           if not tracks:
-              print("❌ No tracks found")
-              with open('search-results/links.txt', 'w') as f:
-                  f.write('No results found')
+              with open(f"{base_dir}/README.md", 'w', encoding='utf-8') as f:
+                  f.write(f"# 🔍 {query}\n\n❌ No results found.\n")
               exit()
 
-          print(f"✅ Found {len(tracks)} tracks:\n")
+          print(f"✅ Found {len(tracks)} tracks\n")
 
+          # Build data
           links = {}
-          all_links = []
+          seen_urls = set()
 
           for i, t in enumerate(tracks):
-              artist = t.get('uploader', t.get('artist', 'Unknown'))
+              artist_name = t.get('uploader', t.get('artist', 'Unknown'))
               title = t.get('title', 'Unknown')
               url = t.get('webpage_url', t.get('url', ''))
               duration = t.get('duration', 0) or 0
+              thumbnail = t.get('thumbnail', '')
+              description = (t.get('description', '') or '')[:200]
+              view_count = t.get('view_count', 0) or 0
+              like_count = t.get('like_count', 0) or 0
+              upload_date = t.get('upload_date', '') or ''
               
-              track_info = {
-                  'index': i + 1,
-                  'artist': artist,
-                  'title': title,
-                  'url': url,
-                  'duration_seconds': int(duration),
-                  'plays': t.get('view_count', 0) or 0,
-                  'description': (t.get('description', '') or '')[:200]
-              }
-              
-              all_links.append(track_info)
-              
-              if artist not in links:
-                  links[artist] = []
-              links[artist].append(track_info)
+              # Skip duplicates
+              if url in seen_urls:
+                  continue
+              seen_urls.add(url)
               
               mins = int(duration // 60)
               secs = int(duration % 60)
-              print(f"{i+1}. {artist} - {title}")
+              
+              # Format date
+              if upload_date and len(upload_date) == 8:
+                  upload_date = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+              
+              track_info = {
+                  'index': i + 1,
+                  'artist': artist_name,
+                  'title': title,
+                  'url': url,
+                  'duration': f"{mins}:{secs:02d}",
+                  'duration_seconds': int(duration),
+                  'thumbnail': thumbnail,
+                  'plays': view_count,
+                  'likes': like_count,
+                  'upload_date': upload_date,
+                  'description': description
+              }
+              
+              if artist_name not in links:
+                  links[artist_name] = []
+              links[artist_name].append(track_info)
+              
+              print(f"{i+1}. {artist_name} - {title}")
               print(f"   ⏱ {mins}:{secs:02d} | 🔗 {url}\n")
 
-          # Save JSON
+          # --- Save links.json ---
           output = {
-              'query': f"{os.environ.get('ARTIST', '')} {os.environ.get('SONG', '')}".strip(),
-              'date': __import__('datetime').datetime.now().isoformat(),
-              'total': len(tracks),
+              'query': query,
+              'artist': artist,
+              'song': song if song else 'all',
+              'date': datetime.datetime.now().isoformat(),
+              'total': len(seen_urls),
               'links_by_artist': links,
-              'all_links': all_links
+              'all_links': [t for tracks_list in links.values() for t in tracks_list]
           }
           
-          with open('search-results/links.json', 'w') as f:
-              json.dump(output, f, indent=2)
+          with open(f"{base_dir}/links.json", 'w', encoding='utf-8') as f:
+              json.dump(output, f, indent=2, ensure_ascii=False)
 
-          # Save URLs only
-          with open('search-results/links.txt', 'w') as f:
-              f.write(f"# SoundCloud Search: {output['query']}\n")
-              f.write(f"# Date: {output['date']}\n\n")
+          # --- Save links.txt (just URLs) ---
+          with open(f"{base_dir}/links.txt", 'w', encoding='utf-8') as f:
+              f.write(f"# SoundCloud Links: {query}\n")
+              f.write(f"# Date: {datetime.datetime.now().isoformat()}\n")
+              f.write(f"# Total: {len(seen_urls)} tracks\n\n")
+              for artist_name, tracks_list in links.items():
+                  f.write(f"## {artist_name} ({len(tracks_list)} tracks)\n")
+                  for t in tracks_list:
+                      f.write(f"{t['url']}\n")
+                  f.write('\n')
+
+          # --- Save README.md (beautiful) ---
+          now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+          
+          readme = f"""<div align="center">
+
+# 🎵 {artist}
+
+### SoundCloud Search Results
+
+**Query:** `{query}`  
+**Date:** {now}  
+**Total Tracks:** {len(seen_urls)}
+
+---
+
+</div>
+
+"""
+          
+          for artist_name, tracks_list in links.items():
+              readme += f"## 📌 {artist_name} ({len(tracks_list)} tracks)\n\n"
+              readme += """<table>
+  <tr>
+    <th>#</th>
+    <th>Cover</th>
+    <th>Title</th>
+    <th>Duration</th>
+    <th>Plays</th>
+    <th>Link</th>
+  </tr>
+"""
+              
+              for t in tracks_list:
+                  cover_img = t['thumbnail'] if t['thumbnail'] else ''
+                  cover_html = f'<img src="{cover_img}" width="80" height="80" style="border-radius:8px">' if cover_img else '—'
+                  plays = f"{t['plays']:,}" if t['plays'] else '—'
+                  
+                  readme += f"""  <tr>
+    <td align="center">{t['index']}</td>
+    <td align="center">{cover_html}</td>
+    <td><strong>{t['title']}</strong></td>
+    <td align="center"><code>{t['duration']}</code></td>
+    <td align="center">{plays}</td>
+    <td><a href="{t['url']}" target="_blank">🔗 Listen</a></td>
+  </tr>
+"""
+              
+              readme += "</table>\n\n"
+              
+              # Also add text links section
+              readme += "### 📋 Direct Links\n\n"
+              for t in tracks_list:
+                  readme += f"- [{t['title']}]({t['url']}) `{t['duration']}`\n"
+              readme += "\n---\n\n"
+          
+          readme += f"""<div align="center">
+
+*Generated by SoundCloud Search Workflow*
+
+</div>
+"""
+          
+          with open(f"{base_dir}/README.md", 'w', encoding='utf-8') as f:
+              f.write(readme)
+
+          # --- Save share-links.txt (just share URLs) ---
+          with open(f"{base_dir}/share-links.txt", 'w', encoding='utf-8') as f:
+              f.write(f"# Share Links for: {query}\n")
+              f.write(f"# Copy these to share or download\n\n")
               for artist_name, tracks_list in links.items():
                   f.write(f"## {artist_name}\n")
                   for t in tracks_list:
                       f.write(f"{t['url']}\n")
                   f.write('\n')
 
-          print("✅ Saved to search-results/")
+          print(f"\n✅ Files saved in {base_dir}/:")
+          print(f"   • README.md  (beautiful table with covers)")
+          print(f"   • links.json (full data)")
+          print(f"   • links.txt  (URLs only)")
+          print(f"   • share-links.txt (share URLs)")
           PYEOF
 
-      - name: Show links
+      - name: Show results
         run: |
-          if [ -f search-results/links.txt ]; then
-            cat search-results/links.txt
-          fi
+          echo ""
+          echo "📋 Results:"
+          cat "search-results/${{ github.event.inputs.artist }}/share-links.txt" 2>/dev/null || echo "No results"
 
       - name: Commit
         if: always()
@@ -155,7 +258,5 @@ jobs:
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
-          git add search-results/
-          git diff --staged --quiet || git commit -m "🔍 $ARTIST" && git push
-        env:
-          ARTIST: ${{ github.event.inputs.artist }}
+          git add "search-results/${{ github.event.inputs.artist }}/"
+          git diff --staged --quiet || git commit -m "🔍 ${{ github.event.inputs.artist }}${{ github.event.inputs.song && format(' - {0}', github.event.inputs.song) || '' }}" && git push
