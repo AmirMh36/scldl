@@ -1,8 +1,16 @@
 {
-  "date": "2026-05-13T07:14:09.163Z",
+  "date": "2026-05-13T07:22:33.133Z",
   "source": "https://soundcloud.com/charlottedewittemusic/amor-feat-ceres",
-  "count": 1,
+  "type": "track",
+  "totalTracks": 1,
   "files": [
-    "Charlotte de Witte - Amor (feat. CERES).mp3"
+    {
+      "file": "Charlotte de Witte - Amor (feat. CERES).aac",
+      "format": "aac",
+      "title": "Amor (feat. CERES)",
+      "artist": "Charlotte de Witte",
+      "duration": "372s",
+      "size": 7521568
+    }
   ]
 }
