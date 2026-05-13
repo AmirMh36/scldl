@@ -1,23 +1,28 @@
 # .github/workflows/soundcloud-search.yml
-name: SoundCloud Search & Download
+name: SoundCloud Search & Extract Links
 
 on:
   workflow_dispatch:
     inputs:
-      query:
-        description: 'Search query'
+      artist:
+        description: 'Artist name to search'
         required: true
+        type: string
+      song:
+        description: 'Song name (optional - leave empty to get all songs)'
+        required: false
+        default: ''
         type: string
       limit:
         description: 'Number of results'
         required: false
-        default: '5'
+        default: '10'
         type: string
 
 jobs:
   search:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     permissions:
       contents: write
 
@@ -27,21 +32,15 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Setup Node.js and FFmpeg
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
-          npm install btch-downloader
-          echo "✅ Ready"
-
-      - name: Search SoundCloud
+      - name: Search and extract links
         env:
-          QUERY: ${{ github.event.inputs.query }}
+          ARTIST: ${{ github.event.inputs.artist }}
+          SONG: ${{ github.event.inputs.song }}
           LIMIT: ${{ github.event.inputs.limit }}
         run: |
           mkdir -p search-results
@@ -50,83 +49,128 @@ jobs:
           const fs = require('fs');
           const https = require('https');
 
-          const query = process.env.QUERY;
-          const limit = parseInt(process.env.LIMIT) || 5;
+          const artist = process.env.ARTIST;
+          const song = process.env.SONG;
+          const limit = parseInt(process.env.LIMIT) || 10;
           const clientId = 'a3e059563d7fd3372b49b37f00a00bcf';
+
+          // Build search query
+          let query = artist;
+          if (song) query = `${artist} ${song}`;
 
           const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=${limit}`;
 
           console.log('🔍 Searching SoundCloud...');
-          console.log(`Query: "${query}"`);
+          console.log(`Artist: ${artist}`);
+          if (song) console.log(`Song: ${song}`);
+          console.log(`Limit: ${limit}`);
           console.log('');
 
           https.get(searchUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
             let data = '';
             res.on('data', chunk => data += chunk);
             res.on('end', () => {
-              try {
-                const json = JSON.parse(data);
-                const tracks = json.collection || [];
+              const json = JSON.parse(data);
+              const tracks = json.collection || [];
 
-                if (tracks.length === 0) {
-                  console.log('❌ No results found');
-                  process.exit(0);
-                }
+              if (tracks.length === 0) {
+                console.log('❌ No results found');
+                process.exit(0);
+              }
 
-                console.log(`📊 Found ${tracks.length} results:\n`);
+              console.log(`📊 Found ${tracks.length} tracks:\n`);
 
-                const results = tracks.map((track, i) => {
-                  const title = track.title || 'Unknown';
-                  const artist = track.user?.username || 'Unknown';
-                  const url = track.permalink_url || '';
-                  const duration = Math.floor((track.duration || 0) / 1000);
-                  const mins = Math.floor(duration / 60);
-                  const secs = duration % 60;
-                  const plays = (track.playback_count || 0).toLocaleString();
-                  const genre = track.genre || 'N/A';
+              // Extract links grouped by artist
+              const linksByArtist = {};
+              const allLinks = [];
 
-                  console.log(`${i + 1}. ${artist} - ${title}`);
-                  console.log(`   ⏱ ${mins}:${secs.toString().padStart(2,'0')} | ▶ ${plays} plays | 🏷 ${genre}`);
-                  console.log(`   🔗 ${url}`);
-                  console.log('');
-
-                  return {
-                    index: i + 1,
-                    title,
-                    artist,
-                    url,
-                    duration: `${mins}:${secs.toString().padStart(2,'0')}`,
-                    plays,
-                    genre,
-                    artwork: track.artwork_url || track.user?.avatar_url || ''
-                  };
-                });
-
-                // Save results
-                const output = {
-                  query,
-                  date: new Date().toISOString(),
-                  total: tracks.length,
-                  results
+              tracks.forEach((track, i) => {
+                const trackArtist = track.user?.username || 'Unknown';
+                const title = track.title || 'Unknown';
+                const url = track.permalink_url || '';
+                const duration = Math.floor((track.duration || 0) / 1000);
+                const mins = Math.floor(duration / 60);
+                const secs = duration % 60;
+                const artwork = track.artwork_url || '';
+                
+                const trackInfo = {
+                  index: i + 1,
+                  artist: trackArtist,
+                  title: title,
+                  url: url,
+                  duration: `${mins}:${secs.toString().padStart(2, '0')}`,
+                  duration_seconds: duration,
+                  plays: track.playback_count || 0,
+                  likes: track.likes_count || track.favoritings_count || 0,
+                  genre: track.genre || 'Unknown',
+                  artwork: artwork.replace('large', 't500x500') || '',
+                  created_at: track.created_at || '',
+                  description: (track.description || '').substring(0, 200)
                 };
 
-                fs.writeFileSync('search-results/search.json', JSON.stringify(output, null, 2));
-                console.log('✅ Results saved to search-results/search.json');
+                allLinks.push(trackInfo);
 
-                // Also save as readable text
-                let text = `SoundCloud Search: "${query}"\n`;
-                text += '='.repeat(50) + '\n\n';
-                results.forEach(r => {
-                  text += `${r.index}. ${r.artist} - ${r.title}\n`;
-                  text += `   Duration: ${r.duration} | Plays: ${r.plays}\n`;
-                  text += `   URL: ${r.url}\n\n`;
+                // Group by artist
+                if (!linksByArtist[trackArtist]) {
+                  linksByArtist[trackArtist] = [];
+                }
+                linksByArtist[trackArtist].push(trackInfo);
+
+                // Print to console
+                console.log(`${i + 1}. ${trackArtist} - ${title}`);
+                console.log(`   ⏱ ${mins}:${secs.toString().padStart(2, '0')} | ▶ ${(track.playback_count || 0).toLocaleString()} | ❤ ${track.likes_count || 0}`);
+                console.log(`   🔗 ${url}`);
+                console.log('');
+              });
+
+              // Save all links as JSON
+              const output = {
+                search_query: query,
+                artist: artist,
+                song: song || 'all',
+                date: new Date().toISOString(),
+                total_results: tracks.length,
+                links_by_artist: linksByArtist,
+                all_links: allLinks
+              };
+
+              fs.writeFileSync('search-results/links.json', JSON.stringify(output, null, 2));
+
+              // Save just URLs (simple list)
+              let urlList = `# SoundCloud Links for "${query}"\n`;
+              urlList += `# Generated: ${new Date().toISOString()}\n\n`;
+
+              Object.keys(linksByArtist).forEach(artistName => {
+                urlList += `## ${artistName}\n`;
+                linksByArtist[artistName].forEach(track => {
+                  urlList += `${track.url}\n`;
                 });
-                fs.writeFileSync('search-results/search.txt', text);
+                urlList += '\n';
+              });
 
-              } catch (err) {
-                console.error('❌ Parse error:', err.message);
-                console.log('Raw response:', data.substring(0, 500));
-              }
+              fs.writeFileSync('search-results/links.txt', urlList);
+
+              // Save summary
+              let summary = `🎵 SoundCloud Search Results\n`;
+              summary += '='.repeat(50) + '\n\n';
+              summary += `Query: "${query}"\n`;
+              summary += `Date: ${new Date().toLocaleString()}\n`;
+              summary += `Total: ${tracks.length} tracks\n\n`;
+
+              Object.keys(linksByArtist).forEach(artistName => {
+                summary += `📌 ${artistName} (${linksByArtist[artistName].length} tracks):\n`;
+                linksByArtist[artistName].forEach(track => {
+                  summary += `   ${track.title}: ${track.url}\n`;
+                });
+                summary += '\n';
+              });
+
+              fs.writeFileSync('search-results/README.md', summary);
+
+              console.log('✅ Files saved:');
+              console.log('   - search-results/links.json (full data)');
+              console.log('   - search-results/links.txt (just URLs)');
+              console.log('   - search-results/README.md (summary)');
             });
           }).on('error', (err) => {
             console.error('❌ Request error:', err.message);
@@ -135,11 +179,13 @@ jobs:
           
           node search.js
 
-      - name: Show results
+      - name: Show extracted links
         run: |
-          if [ -f search-results/search.txt ]; then
-            echo "📋 Search Results:"
-            cat search-results/search.txt
+          if [ -f search-results/links.txt ]; then
+            echo ""
+            echo "📋 Extracted Links:"
+            echo "===================="
+            cat search-results/links.txt
           fi
 
       - name: Commit results
@@ -151,9 +197,9 @@ jobs:
           git add search-results/
           
           if git diff --staged --quiet; then
-            echo "No changes"
+            echo "No changes to commit"
           else
-            git commit -m "🔍 Search: ${{ github.event.inputs.query }}"
+            git commit -m "🔍 Search: ${{ github.event.inputs.artist }}${{ github.event.inputs.song && ' - ' || '' }}${{ github.event.inputs.song }}"
             git push
-            echo "✅ Results committed!"
+            echo "✅ Committed!"
           fi
