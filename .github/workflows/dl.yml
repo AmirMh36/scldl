@@ -1,5 +1,5 @@
-# .github/workflows/soundcloud-private-puppeteer-stream.yml
-name: SoundCloud Private (Puppeteer + Curl)
+# .github/workflows/soundcloud-private-stream.yml
+name: SoundCloud Private (Puppeteer Stream)
 
 on:
   workflow_dispatch:
@@ -9,37 +9,42 @@ on:
         required: true
         type: string
 
-env:
-  OUTPUT_DIR: music-downloads
-
 jobs:
   download:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
 
     steps:
       - uses: actions/checkout@v5
 
-      - name: Setup Node.js & FFmpeg
+      - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: '24'
 
-      - name: Install Puppeteer & tools
+      - name: Install system dependencies (optimized)
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg curl jq
+          # بروزرسانی کش و نصب فقط ffmpeg, jq (curl از قبل نصب است)
+          sudo apt-get update -o Acquire::http::No-Cache=True -o Acquire::BrokenProxy=true -y -qq || true
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg jq || true
+          echo "✅ System deps checked"
+
+      - name: Install puppeteer
+        run: |
           npm init -y
           npm install puppeteer
+          echo "✅ puppeteer installed"
 
-      - name: Extract Token, Run Puppeteer & Download
+      - name: Restore cookies and capture stream
         env:
           SC_URL: ${{ github.event.inputs.url }}
           SC_COOKIES: ${{ secrets.SC_COOKIES }}
         run: |
           mkdir -p "$OUTPUT_DIR"
           echo "$SC_COOKIES" > cookies.txt
-          
+
           cat > get_stream.js << 'SCRIPT'
           const puppeteer = require('puppeteer');
           const fs = require('fs');
@@ -48,9 +53,7 @@ jobs:
             const url = process.env.SC_URL;
             const cookiesText = fs.readFileSync('cookies.txt', 'utf8');
             
-            // Parse cookies
-            const cookies = cookiesText
-              .split('\n')
+            const cookies = cookiesText.split('\n')
               .filter(line => line && !line.startsWith('#'))
               .map(line => {
                 const p = line.split('\t');
@@ -58,48 +61,41 @@ jobs:
                   name: p[5].trim(), value: p[6].trim(),
                   domain: p[0].trim().replace(/^\./, ''),
                   path: p[2].trim(), httpOnly: p[3].trim() === 'TRUE',
-                  secure: p[1].trim() === 'TRUE',
-                  expires: parseInt(p[4]) || undefined
+                  secure: p[1].trim() === 'TRUE', expires: parseInt(p[4]) || undefined
                 };
               }).filter(c => c && c.name);
             
-            console.log(`Cookies loaded: ${cookies.length}`);
+            console.log(`Cookies: ${cookies.length}`);
 
             const browser = await puppeteer.launch({
               headless: 'new',
-              args: ['--no-sandbox', '--disable-setuid-sandbox', '--autoplay-policy=no-user-gesture-required']
+              args: ['--no-sandbox','--disable-setuid-sandbox','--autoplay-policy=no-user-gesture-required']
             });
             const page = await browser.newPage();
             await page.setCookie(...cookies);
-            
-            // Intercept network requests to capture audio stream
+
             let streamUrl = null;
-            let streamHeaders = null;
             await page.setRequestInterception(true);
             page.on('request', req => {
               const u = req.url();
-              // انواع لینک‌های صوتی: progressive mp3, m4a, HLS m3u8, init.mp4
               if (u.includes('.mp3') || u.includes('/media/') || u.includes('/stream/') || u.includes('.m3u8') || u.includes('/cenc/')) {
-                console.log('🎯 Found stream:', u.substring(0, 150));
+                console.log('🎯 stream:', u.substring(0,150));
                 streamUrl = u;
-                streamHeaders = req.headers();
-                req.abort(); // stop loading in browser
+                req.abort();
               } else {
                 req.continue();
               }
             });
 
-            console.log('Opening track page...');
+            console.log('goto...');
             await page.goto(url, { waitUntil: 'networkidle2', timeout: 40000 });
-            
-            // Get metadata
-            const metadata = await page.evaluate(() => ({
+
+            const meta = await page.evaluate(() => ({
               title: document.querySelector('meta[property="og:title"]')?.content || 'Unknown',
               artist: document.querySelector('meta[property="soundcloud:author"]')?.content || 'Unknown'
             }));
-            console.log(`Track: ${metadata.artist} - ${metadata.title}`);
+            console.log(`🎵 ${meta.artist} - ${meta.title}`);
 
-            // Click Play button safely
             const clicked = await page.evaluate(() => {
               const btn = document.querySelector('button.playControl') ||
                           document.querySelector('.playControl') ||
@@ -108,75 +104,62 @@ jobs:
               return false;
             });
             console.log(`Play clicked: ${clicked}`);
-
-            // Wait for stream to be intercepted
-            await new Promise(r => setTimeout(r, 6000));
+            await new Promise(r => setTimeout(r, 7000));
 
             await browser.close();
 
             if (!streamUrl) {
-              console.error('No stream URL captured.');
+              console.error('No stream captured');
               process.exit(1);
             }
 
-            // Save URL and essential headers for curl
-            const info = {
+            fs.writeFileSync('stream_info.json', JSON.stringify({
               url: streamUrl,
               headers: {
                 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
                 'Referer': 'https://soundcloud.com/',
-                'Origin': 'https://soundcloud.com',
-                'Accept': '*/*'
+                'Origin': 'https://soundcloud.com'
               },
-              metadata
-            };
-            fs.writeFileSync('stream_info.json', JSON.stringify(info, null, 2));
-            console.log('Stream info saved to stream_info.json');
+              metadata: meta
+            }));
+            console.log('stream_info.json saved');
           })();
           SCRIPT
-          
           node get_stream.js
 
-          # حالا stream_info.json را بخوان و دانلود کن
-          if [ ! -f stream_info.json ]; then
-            echo "❌ stream_info.json not created"
-            exit 1
-          fi
-
+      - name: Download audio with curl
+        if: success()
+        run: |
+          if [ ! -f stream_info.json ]; then exit 1; fi
           STREAM_URL=$(jq -r '.url' stream_info.json)
           TITLE=$(jq -r '.metadata.title' stream_info.json)
           ARTIST=$(jq -r '.metadata.artist' stream_info.json)
-          
-          echo "📥 Downloading stream: ${STREAM_URL:0:100}..."
           SAFE_NAME=$(echo "${ARTIST} - ${TITLE}" | sed 's/[<>:"/\\|?*]/_/g' | cut -c1-100)
           
-          # دانلود با curl و ارسال هدرهای ضروری
-          curl -L -o "$OUTPUT_DIR/temp_audio" \
+          curl -L -o "temp_audio" \
             -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
             -H "Referer: https://soundcloud.com/" \
             -H "Origin: https://soundcloud.com" \
             -b cookies.txt \
             "$STREAM_URL"
-
-          if [ -f "$OUTPUT_DIR/temp_audio" ] && [ $(stat -c%s "$OUTPUT_DIR/temp_audio") -gt 10240 ]; then
-            # تبدیل به MP3 با ffmpeg
-            ffmpeg -i "$OUTPUT_DIR/temp_audio" \
-              -c:a libmp3lame -b:a 320k -ar 44100 \
+          
+          if [ -f temp_audio ] && [ $(stat -c%s temp_audio) -gt 10240 ]; then
+            ffmpeg -i temp_audio -c:a libmp3lame -b:a 320k -ar 44100 \
               -metadata title="$TITLE" -metadata artist="$ARTIST" \
-              -y "$OUTPUT_DIR/${SAFE_NAME}.mp3"
-            rm "$OUTPUT_DIR/temp_audio"
-            echo "✅ دانلود کامل: ${SAFE_NAME}.mp3"
+              -y "music-downloads/${SAFE_NAME}.mp3"
+            rm temp_audio
+            echo "✅ Downloaded: ${SAFE_NAME}.mp3"
           else
-            echo "❌ دانلود ناموفق یا فایل خیلی کوچک"
+            echo "❌ Download failed or empty file"
             exit 1
           fi
 
-      - name: Commit & Push
+      - name: Commit
         if: always()
         run: |
-          find "$OUTPUT_DIR" -type f ! -name "*.mp3" -delete
-          find "$OUTPUT_DIR" -name "*.mp3" -size -10240c -delete
+          find music-downloads -type f ! -name "*.mp3" -delete
+          find music-downloads -name "*.mp3" -size -10240c -delete
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
-          git add "$OUTPUT_DIR/"
+          git add music-downloads/
           git diff --staged --quiet || git commit -m "🎵 $(date +%H:%M)" && git push
