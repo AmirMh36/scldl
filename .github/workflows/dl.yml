@@ -26,13 +26,13 @@ jobs:
         with:
           node-version: '24'
 
-      - name: نصب Puppeteer و FFmpeg
+      - name: Install Puppeteer and FFmpeg
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           npm init -y
           npm install puppeteer
 
-      - name: بازسازی کوکی‌ها و دانلود
+      - name: Restore cookies and download
         env:
           SC_URL: ${{ github.event.inputs.url }}
           SC_COOKIES: ${{ secrets.SC_COOKIES }}
@@ -50,7 +50,7 @@ jobs:
             const url = process.env.SC_URL;
             const cookiesText = fs.readFileSync('cookies.txt', 'utf8');
             
-            // تبدیل فایل کوکی Netscape به آرایه‌ای از کوکی‌ها
+            // Parse Netscape cookie file into an array of cookies for Puppeteer
             const cookies = cookiesText
               .split('\n')
               .filter(line => line && !line.startsWith('#'))
@@ -69,7 +69,7 @@ jobs:
                 }
               }).filter(c => c && c.name);
 
-            console.log(`✅ بارگذاری ${cookies.length} کوکی`);
+            console.log(`✅ Loaded ${cookies.length} cookies`);
 
             const browser = await puppeteer.launch({
               headless: 'new',
@@ -77,13 +77,13 @@ jobs:
             });
             const page = await browser.newPage();
             
-            // تنظیم کوکی‌ها
+            // Set cookies before navigating
             await page.setCookie(...cookies);
             
-            console.log('🎯 باز کردن صفحه آهنگ...');
+            console.log('🎯 Opening track page...');
             await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
             
-            // استخراج اطلاعات آهنگ
+            // Extract track metadata
             const metadata = await page.evaluate(() => {
               const title = document.querySelector('meta[property="og:title"]')?.getAttribute('content') || 'unknown';
               const artist = document.querySelector('meta[property="soundcloud:author"]')?.getAttribute('content') || 'unknown';
@@ -93,20 +93,21 @@ jobs:
 
             let streamUrl = null;
             
-            // روش ۱: رهگیری شبکه + کلیک ایمن
+            // Method 1: Intercept network requests and try to trigger playback
             await page.setRequestInterception(true);
             page.on('request', req => {
-              const url = req.url();
-              if (url.includes('.mp3') || url.includes('/media/') || url.includes('/stream/')) {
-                console.log('🎯 لینک استریم پیدا شد:', url.substring(0, 100));
-                streamUrl = url;
-                req.abort();
+              const reqUrl = req.url();
+              // Look for audio stream URLs (both .mp3 and HLS .m3u8)
+              if (reqUrl.includes('.mp3') || reqUrl.includes('/media/') || reqUrl.includes('/stream/') || reqUrl.includes('.m3u8')) {
+                console.log('🎯 Stream URL found:', reqUrl.substring(0, 120));
+                streamUrl = reqUrl;
+                req.abort(); // Don't actually load the stream in the browser
               } else {
                 req.continue();
               }
             });
 
-            // کلیک با JavaScript خالص
+            // Click the Play button safely using evaluate
             const clicked = await page.evaluate(() => {
               const btn = document.querySelector('button.playControl') ||
                           document.querySelector('.playControl') ||
@@ -120,42 +121,57 @@ jobs:
             });
             
             if (clicked) {
-              console.log('✅ دکمه Play کلیک شد، منتظر استریم...');
-              await new Promise(r => setTimeout(r, 5000));
+              console.log('✅ Play button clicked, waiting for stream...');
+              // Wait longer and also try to scroll a bit to ensure the player loads
+              await page.evaluate(() => window.scrollBy(0, 300));
+              await new Promise(r => setTimeout(r, 8000));
             } else {
-              console.log('⚠️ دکمه Play پیدا نشد');
+              console.log('⚠️ Play button not found');
             }
 
-            // روش ۲: اگر استریم پیدا نشد، در source جستجو کن
+            // Method 2: If stream not intercepted, try extracting from page source
             if (!streamUrl) {
-              console.log('🔄 جستجوی URL در source صفحه...');
+              console.log('🔄 Searching for stream URL in page source...');
               const pageSource = await page.content();
-              const match = pageSource.match(/"url":"(https:\\\/\\\/[^"]+\.mp3[^"]*)"/);
-              if (match) {
-                streamUrl = match[1].replace(/\\\//g, '/');
-                console.log('🎯 از source پیدا شد');
+              // Try to find stream URLs in the page's JavaScript state
+              const matches = pageSource.match(/"url"\s*:\s*"(https:[^"]+\.mp3[^"]*)"/);
+              if (matches) {
+                streamUrl = matches[1].replace(/\\\//g, '/');
+                console.log('🎯 Found in source');
               }
+            }
+
+            // Method 3: Try the oEmbed endpoint as last resort
+            if (!streamUrl) {
+              console.log('🔄 Trying oEmbed endpoint...');
+              try {
+                const oembedUrl = `https://soundcloud.com/oembed?format=json&url=${encodeURIComponent(url)}`;
+                const response = await fetch(oembedUrl);
+                const data = await response.json();
+                // The oembed doesn't provide a direct stream, but confirms the track exists
+                console.log('Track confirmed via oembed');
+              } catch (e) {}
             }
 
             await browser.close();
 
             if (!streamUrl) {
-              console.error('❌ هیچ لینک استریمی پیدا نشد');
+              console.error('❌ No stream URL found');
               process.exit(1);
             }
 
-            // دانلود با FFmpeg
+            // Download with FFmpeg
             const safeName = `${metadata.artist} - ${metadata.title}`.replace(/[<>:"/\\|?*]/g, '').substring(0, 100);
             const output = path.join(process.env.OUTPUT_DIR, `${safeName}.mp3`);
             
-            console.log('⬇️ دانلود با FFmpeg...');
+            console.log('⬇️ Downloading with FFmpeg...');
             execSync(`ffmpeg -i "${streamUrl}" -c:a libmp3lame -b:a 320k -ar 44100 -y "${output}"`, { stdio: 'inherit' });
             
             if (fs.existsSync(output)) {
               const sizeMB = (fs.statSync(output).size / 1_048_576).toFixed(1);
-              console.log(`✅ ذخیره شد: ${safeName}.mp3 (${sizeMB} MB)`);
+              console.log(`✅ Saved: ${safeName}.mp3 (${sizeMB} MB)`);
             } else {
-              console.error('❌ دانلود ناموفق');
+              console.error('❌ Download failed');
               process.exit(1);
             }
           })();
@@ -163,13 +179,13 @@ jobs:
           
           node download.js
 
-      - name: پاکسازی فایل موقت
+      - name: Cleanup temp files
         run: rm -f cookies.txt
 
-      - name: نمایش فایل‌ها
+      - name: Show files
         run: ls -lh "$OUTPUT_DIR"
 
-      - name: Commit و Push
+      - name: Commit and push
         if: always()
         run: |
           find "$OUTPUT_DIR" -name "*.mp3" -size -10240c -delete
