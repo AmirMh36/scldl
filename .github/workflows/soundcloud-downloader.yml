@@ -25,15 +25,26 @@ jobs:
   download:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT || github.token }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -n 1
+          echo "✅ FFmpeg installed"
 
       - name: Create project and install dependency
         run: |
@@ -41,12 +52,14 @@ jobs:
           cd sc-downloader
           npm init -y
           npm install @snwfdhmp/soundcloud-downloader
+          npm install fluent-ffmpeg
 
       - name: Create download script
         run: |
           cat > sc-downloader/download.js << 'SCRIPT_EOF'
           const fs = require('fs');
           const path = require('path');
+          const { execSync } = require('child_process');
           const scdl = require('@snwfdhmp/soundcloud-downloader').default;
 
           const URL = process.env.SC_URL;
@@ -62,43 +75,119 @@ jobs:
               .replace(/[<>:"/\\|?*]/g, '')
               .replace(/['']/g, "'")
               .replace(/[""]/g, '"')
+              .replace(/\//g, '-')
               .trim()
               .substring(0, maxLen) || 'unknown';
           }
 
+          function convertToMp3(inputPath, outputPath) {
+            console.log('  🔄 Converting to MP3...');
+            try {
+              execSync(
+                `ffmpeg -i "${inputPath}" -codec:a libmp3lame -q:a 2 -y "${outputPath}"`,
+                { stdio: 'pipe', timeout: 60000 }
+              );
+              const stats = fs.statSync(outputPath);
+              console.log(`  ✅ MP3 saved: ${outputPath} (${(stats.size / 1024 / 1024).toFixed(1)} MB)`);
+              return true;
+            } catch (err) {
+              console.error('  ⚠️ FFmpeg conversion failed:', err.message);
+              return false;
+            }
+          }
+
+          function detectFormat(filePath) {
+            try {
+              const result = execSync(
+                `ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "${filePath}"`,
+                { encoding: 'utf8', timeout: 10000 }
+              ).trim();
+              return result;
+            } catch {
+              return 'unknown';
+            }
+          }
+
           async function downloadSingleTrack(trackUrl) {
             const info = await scdl.getInfo(trackUrl);
-            const fileName = cleanName(`${info.user?.username || 'unknown'} - ${info.title || 'unknown'}`) + '.mp3';
-            const filePath = path.join(OUTPUT_DIR, fileName);
-
-            console.log(`  ⬇ Downloading: ${fileName}`);
+            const baseName = cleanName(`${info.user?.username || 'unknown'} - ${info.title || 'unknown'}`);
+            
+            // Step 1: Download original file
+            const tempFile = path.join(OUTPUT_DIR, `${baseName}_temp`);
+            console.log(`  ⬇ Downloading: ${info.user?.username} - ${info.title}`);
 
             const stream = await scdl.download(trackUrl);
-            const writeStream = fs.createWriteStream(filePath);
+            const writeStream = fs.createWriteStream(tempFile);
             stream.pipe(writeStream);
 
             await new Promise((resolve, reject) => {
               writeStream.on('finish', resolve);
               writeStream.on('error', reject);
+              stream.on('error', reject);
             });
 
-            const stats = fs.statSync(filePath);
-            console.log(`  ✅ Saved: ${fileName} (${(stats.size / 1024 / 1024).toFixed(1)} MB)`);
-            return { fileName, filePath, info };
+            const originalSize = fs.statSync(tempFile).size;
+            const originalFormat = detectFormat(tempFile);
+            console.log(`  📥 Downloaded: ${(originalSize / 1024 / 1024).toFixed(1)} MB (format: ${originalFormat})`);
+
+            // Step 2: Convert to MP3
+            const finalFile = path.join(OUTPUT_DIR, `${baseName}.mp3`);
+            
+            if (originalFormat === 'mp3') {
+              // Already MP3, just rename
+              fs.renameSync(tempFile, finalFile);
+              console.log(`  ✅ Already MP3, saved as: ${baseName}.mp3`);
+            } else {
+              // Convert to MP3
+              const success = convertToMp3(tempFile, finalFile);
+              if (success) {
+                // Delete temp file
+                fs.unlinkSync(tempFile);
+              } else {
+                // Keep original if conversion fails
+                const ext = originalFormat || 'audio';
+                const fallbackFile = path.join(OUTPUT_DIR, `${baseName}.${ext}`);
+                fs.renameSync(tempFile, fallbackFile);
+                console.log(`  ⚠️ Saved original format: ${baseName}.${ext}`);
+                return { 
+                  fileName: `${baseName}.${ext}`, 
+                  filePath: fallbackFile, 
+                  info,
+                  format: originalFormat
+                };
+              }
+            }
+
+            // Add metadata tags
+            console.log('  🏷️ Adding metadata...');
+            try {
+              execSync(
+                `ffmpeg -i "${finalFile}" -metadata title="${info.title || ''}" -metadata artist="${info.user?.username || ''}" -metadata album="${info.user?.username || 'SoundCloud'}" -codec copy -y "${finalFile}.tmp" 2>/dev/null`,
+                { timeout: 10000 }
+              );
+              fs.renameSync(`${finalFile}.tmp`, finalFile);
+            } catch (e) {
+              console.log('  ⚠️ Metadata tagging skipped');
+            }
+
+            return { fileName: `${baseName}.mp3`, filePath: finalFile, info, format: 'mp3' };
           }
 
           async function main() {
-            console.log('\n🎵 SoundCloud Downloader\n');
+            console.log('\n🎵 SoundCloud Downloader (MP3 Converter)\n');
 
             const results = [];
             if (TYPE === 'track') {
-              results.push(await downloadSingleTrack(URL));
+              const result = await downloadSingleTrack(URL);
+              results.push(result);
             } else {
               const playlist = await scdl.getSetInfo(URL);
               console.log(`📋 Playlist: ${playlist.title} (${playlist.tracks.length} tracks)\n`);
-              for (const track of playlist.tracks) {
+              for (let i = 0; i < playlist.tracks.length; i++) {
+                console.log(`[${i + 1}/${playlist.tracks.length}]`);
                 try {
-                  results.push(await downloadSingleTrack(track.permalink_url));
+                  const result = await downloadSingleTrack(playlist.tracks[i].permalink_url);
+                  results.push(result);
                 } catch (err) {
                   console.error(`  ⚠️ Skipped: ${err.message}`);
                 }
@@ -106,21 +195,31 @@ jobs:
             }
 
             // Write summary
+            const summary = {
+              date: new Date().toISOString(),
+              source: URL,
+              type: TYPE,
+              totalTracks: results.length,
+              files: results.map(r => ({
+                file: r.fileName,
+                format: r.format,
+                title: r.info?.title || 'unknown',
+                artist: r.info?.user?.username || 'unknown',
+                duration: r.info?.duration ? `${Math.floor(r.info.duration / 1000)}s` : 'unknown',
+                size: fs.statSync(r.filePath).size
+              }))
+            };
+
             fs.writeFileSync(
               path.join(OUTPUT_DIR, 'summary.json'),
-              JSON.stringify({
-                date: new Date().toISOString(),
-                source: URL,
-                count: results.length,
-                files: results.map(r => r.fileName)
-              }, null, 2)
+              JSON.stringify(summary, null, 2)
             );
 
-            console.log(`\n✅ Done! ${results.length} file(s) downloaded.`);
+            console.log(`\n✅ Done! ${results.length} file(s) downloaded in MP3 format.`);
           }
 
           main().catch(err => {
-            console.error('❌', err.message);
+            console.error('❌ Fatal error:', err.message);
             process.exit(1);
           });
           SCRIPT_EOF
@@ -137,26 +236,28 @@ jobs:
           mkdir -p music-downloads
           cp sc-downloader/downloads/*.mp3 music-downloads/ 2>/dev/null || true
           cp sc-downloader/downloads/*.json music-downloads/ 2>/dev/null || true
-          echo "Files copied to music-downloads/"
+          echo "Files in music-downloads:"
           ls -lh music-downloads/
 
       - name: Commit and push files
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
+          git remote set-url origin https://x-access-token:${{ secrets.GH_PAT || github.token }}@github.com/${{ github.repository }}.git
+          
           git add music-downloads/
           
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "🎵 Downloaded: $(date +%Y-%m-%d_%H-%M-%S)"
+            git commit -m "🎵 Downloaded (MP3): $(date +%Y-%m-%d_%H-%M-%S)"
             git push
-            echo "✅ Files committed to repository!"
+            echo "✅ MP3 files committed to repository!"
           fi
 
       - name: Upload artifacts (backup)
         uses: actions/upload-artifact@v4
         with:
-          name: soundcloud-backup-${{ github.run_id }}
+          name: soundcloud-mp3-${{ github.run_id }}
           path: music-downloads/
           retention-days: 3
