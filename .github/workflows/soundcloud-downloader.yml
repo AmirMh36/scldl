@@ -44,85 +44,72 @@ jobs:
         run: |
           mkdir -p music-downloads
           
-          cat > download.js << 'SCRIPT_EOF'
+          cat > download.js << 'SCRIPT'
           const { soundcloud } = require('btch-downloader');
           const fs = require('fs');
           const { execSync } = require('child_process');
 
           const url = process.env.SC_URL;
-          
-          console.log('🎵 Downloading from SoundCloud...');
+
+          console.log('🎵 SoundCloud Downloader');
           console.log('URL:', url);
           console.log('');
-          
+
           soundcloud(url)
             .then(data => {
-              console.log('📦 Response received!');
-              console.log(JSON.stringify(data, null, 2));
-              
-              // Check what we got
-              if (data && data.audio) {
-                const audioUrl = data.audio;
-                console.log('\n🎧 Audio URL:', audioUrl);
-                console.log('📝 Title:', data.title || 'Unknown');
-                console.log('👤 Artist:', data.author || data.artist || 'Unknown');
-                
-                // Save info
-                fs.writeFileSync('music-downloads/info.json', JSON.stringify(data, null, 2));
-                
-                // Download audio file
-                console.log('\n⬇ Downloading audio file...');
-                const title = (data.title || 'track').replace(/[<>:"/\\|?*]/g, '');
-                const output = `music-downloads/${title}.mp3`;
-                
-                execSync(`ffmpeg -i "${audioUrl}" -c:a libmp3lame -b:a 320k -ar 44100 -y "${output}"`, 
-                  { stdio: 'inherit', timeout: 120000 }
-                );
-                
-                if (fs.existsSync(output)) {
-                  const size = (fs.statSync(output).size / 1024 / 1024).toFixed(1);
-                  console.log(`\n✅ Downloaded: ${title}.mp3 (${size} MB)`);
-                }
-              } else if (data && data.download) {
-                const downloadUrl = data.download;
-                console.log('Download URL:', downloadUrl);
-                execSync(`curl -L -o "music-downloads/track.mp3" "${downloadUrl}"`, { stdio: 'inherit' });
+              // Extract download URL from correct path
+              const downloadUrl = data?.result?.downloadMp3 || 
+                                 data?.result?.audio || 
+                                 data?.downloadMp3 || 
+                                 data?.audio || '';
+
+              if (!downloadUrl || !downloadUrl.startsWith('http')) {
+                console.error('❌ No download URL found');
+                console.log('Response:', JSON.stringify(data, null, 2));
+                process.exit(1);
+              }
+
+              const title = (data?.result?.title || 'soundcloud-track')
+                .replace(/[<>:"/\\|?*]/g, '')
+                .substring(0, 100);
+
+              console.log('📝 Title:', title);
+              console.log('🔗 Found download URL');
+              console.log('⬇ Downloading...');
+
+              const output = `music-downloads/${title}.mp3`;
+
+              execSync(
+                `ffmpeg -i "${downloadUrl}" -c:a libmp3lame -b:a 320k -ar 44100 -y "${output}"`,
+                { stdio: 'inherit', timeout: 120000 }
+              );
+
+              if (fs.existsSync(output)) {
+                const size = (fs.statSync(output).size / 1024 / 1024).toFixed(1);
+                console.log(`\n✅ Done! ${title}.mp3 (${size} MB)`);
               } else {
-                console.log('⚠️ Unexpected response format');
-                // Save any data we got
-                fs.writeFileSync('music-downloads/response.json', JSON.stringify(data, null, 2));
+                console.error('❌ File not created');
+                process.exit(1);
               }
             })
             .catch(err => {
               console.error('❌ Error:', err.message);
               process.exit(1);
             });
-          SCRIPT_EOF
-          
+          SCRIPT
+
           node download.js
 
-      - name: Convert to MP3 if needed
+      - name: Show result
         run: |
-          cd music-downloads
-          
-          # Convert any non-MP3 files
-          for f in *.m4a *.ogg *.opus *.flac *.wav *.aac *.webm 2>/dev/null; do
-            if [ -f "$f" ] && [ $(stat -c%s "$f") -gt 10240 ]; then
-              NAME="${f%.*}"
-              echo "🔄 Converting: $f → ${NAME}.mp3"
-              ffmpeg -nostdin -i "$f" -c:a libmp3lame -b:a 320k -ar 44100 -y "${NAME}.mp3" 2>/dev/null && rm "$f"
-            fi
-          done
-          
           echo ""
-          echo "📁 Final files:"
-          ls -lh *.mp3 2>/dev/null || echo "No MP3 files"
+          echo "📁 Downloaded files:"
+          ls -lh music-downloads/*.mp3 2>/dev/null || echo "No MP3 files"
 
       - name: Commit and push
         if: always()
         run: |
-          # Clean up
-          find music-downloads -type f \( -name "*.json" -o -name "*.txt" \) -delete 2>/dev/null || true
+          # Clean up non-MP3 files
           find music-downloads -type f ! -name "*.mp3" -delete 2>/dev/null || true
           find music-downloads -type f -name "*.mp3" -size -10240c -delete 2>/dev/null || true
           
@@ -137,5 +124,5 @@ jobs:
           else
             git commit -m "🎵 $(date +%Y-%m-%d_%H-%M-%S)"
             git push
-            echo "✅ Done!"
+            echo "✅ Committed to repository!"
           fi
