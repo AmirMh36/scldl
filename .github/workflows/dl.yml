@@ -1,4 +1,4 @@
-name: 🎧 SoundCloud Downloader (Private Tracks)
+name: 🎧 SoundCloud Private Downloader (Puppeteer)
 
 on:
   workflow_dispatch:
@@ -20,61 +20,152 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: نصب yt-dlp و FFmpeg
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: نصب Puppeteer و FFmpeg
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-          python3 -m pip install -U yt-dlp
+          npm init -y
+          npm install puppeteer
 
-      - name: بازسازی فایل کوکی
-        run: |
-          echo "${{ secrets.SC_COOKIES }}" > cookies.txt
-          echo "✅ کوکی‌ها بازسازی شد."
-
-      - name: دانلود آهنگ (با تست همه فرمت‌ها)
+      - name: بازسازی کوکی‌ها و دانلود
         env:
           SC_URL: ${{ github.event.inputs.url }}
+          SC_COOKIES: ${{ secrets.SC_COOKIES }}
         run: |
           mkdir -p "$OUTPUT_DIR"
-          echo "🎵 در حال دانلود (آزمایش progressive و HLS)..."
           
-          # دستور اول: تلاش برای progressive stream با کیفیت اصلی
-          yt-dlp \
-            --cookies cookies.txt \
-            -f "progressive" \
-            --extract-audio \
-            --audio-format mp3 \
-            --audio-quality 320k \
-            --embed-metadata \
-            -o "$OUTPUT_DIR/%(uploader)s - %(title)s.%(ext)s" \
-            "$SC_URL" 2>&1 || echo "⚠️ progressive stream ناموفق بود. در حال تلاش با فرمت عمومی‌تر..."
+          # ذخیره کوکی‌ها در فایل
+          echo "$SC_COOKIES" > cookies.txt
           
-          # اگر progressive کار نکرد، بهترین فرمت موجود را امتحان کن
-          if [ ! "$(ls -A $OUTPUT_DIR/*.mp3 2>/dev/null)" ]; then
-            echo "🔄 تلاش مجدد با بهترین فرمت در دسترس..."
-            yt-dlp \
-              --cookies cookies.txt \
-              -f "bestaudio/best" \
-              --extract-audio \
-              --audio-format mp3 \
-              --audio-quality 320k \
-              --embed-metadata \
-              -o "$OUTPUT_DIR/%(uploader)s - %(title)s.%(ext)s" \
-              "$SC_URL"
-          fi
+          cat > download.js << 'SCRIPT'
+          const puppeteer = require('puppeteer');
+          const fs = require('fs');
+          const { execSync } = require('child_process');
+          const path = require('path');
+
+          (async () => {
+            const url = process.env.SC_URL;
+            const cookiesText = fs.readFileSync('cookies.txt', 'utf8');
+            
+            // تبدیل فایل کوکی Netscape به آرایه‌ای از کوکی‌ها برای Puppeteer
+            const cookies = cookiesText
+              .split('\n')
+              .filter(line => line && !line.startsWith('#'))
+              .map(line => {
+                const parts = line.split('\t');
+                if (parts.length >= 7) {
+                  return {
+                    name: parts[5].trim(),
+                    value: parts[6].trim(),
+                    domain: parts[0].trim().replace(/^\./, ''),
+                    path: parts[2].trim(),
+                    httpOnly: parts[3].trim() === 'TRUE',
+                    secure: parts[1].trim() === 'TRUE',
+                    expires: parseInt(parts[4]) || undefined
+                  };
+                }
+              }).filter(c => c && c.name);
+
+            console.log(`✅ بارگذاری ${cookies.length} کوکی`);
+
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: ['--no-sandbox', '--disable-setuid-sandbox']
+            });
+            const page = await browser.newPage();
+            
+            // تنظیم کوکی‌ها
+            await page.setCookie(...cookies);
+            
+            console.log('🎯 باز کردن صفحه آهنگ...');
+            await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+            
+            // استخراج اطلاعات آهنگ
+            const metadata = await page.evaluate(() => {
+              const title = document.querySelector('meta[property="og:title"]')?.getAttribute('content') || 'unknown';
+              const artist = document.querySelector('meta[property="soundcloud:author"]')?.getAttribute('content') || 'unknown';
+              return { title, artist };
+            });
+            console.log(`🎵 ${metadata.artist} - ${metadata.title}`);
+
+            // رهگیری درخواست‌های شبکه
+            let streamUrl = null;
+            await page.setRequestInterception(true);
+            page.on('request', req => {
+              const url = req.url();
+              if (url.includes('.mp3') || url.includes('/media/') || url.includes('/stream/')) {
+                console.log('🎯 لینک استریم پیدا شد:', url.substring(0, 100));
+                streamUrl = url;
+                req.abort(); // برای جلوگیری از دانلود توسط مرورگر
+              } else {
+                req.continue();
+              }
+            });
+
+            // کلیک روی دکمه Play
+            const playBtn = await page.$('button.playControl');
+            if (playBtn) {
+              console.log('▶️ کلیک روی Play...');
+              await playBtn.click();
+              // منتظر بمانیم تا درخواست صوتی ارسال شود
+              await page.waitForFunction(() => !!window._foundStream, { timeout: 10000 }).catch(() => {});
+              await new Promise(r => setTimeout(r, 3000));
+            }
+
+            if (!streamUrl) {
+              // شاید دکمه play نبود، تلاش برای پیدا کردن progressive URL از API (اگر هنوز در صفحه باشد)
+              console.log('🔄 تلاش برای استخراج از API...');
+              streamUrl = await page.evaluate(() => {
+                const scripts = document.querySelectorAll('script');
+                for (const s of scripts) {
+                  const text = s.textContent;
+                  const match = text.match(/"url"\s*:\s*"([^"]+\.mp3[^"]*)"/);
+                  if (match) return match[1];
+                }
+                return null;
+              });
+            }
+
+            await browser.close();
+
+            if (!streamUrl) {
+              console.error('❌ نتوانستیم لینک دانلود پیدا کنیم.');
+              process.exit(1);
+            }
+
+            // دانلود با FFmpeg
+            const safeName = `${metadata.artist} - ${metadata.title}`.replace(/[<>:"/\\|?*]/g, '').substring(0, 100);
+            const output = path.join(process.env.OUTPUT_DIR, `${safeName}.mp3`);
+            
+            console.log('⬇️ دانلود با FFmpeg...');
+            execSync(`ffmpeg -i "${streamUrl}" -c:a libmp3lame -b:a 320k -ar 44100 -y "${output}"`, { stdio: 'inherit' });
+            
+            if (fs.existsSync(output)) {
+              const sizeMB = (fs.statSync(output).size / 1_048_576).toFixed(1);
+              console.log(`✅ ذخیره شد: ${safeName}.mp3 (${sizeMB} MB)`);
+            } else {
+              console.error('❌ دانلود ناموفق');
+              process.exit(1);
+            }
+          })();
+          SCRIPT
+          
+          node download.js
+
+      - name: پاکسازی
+        run: rm -f cookies.txt
 
       - name: نمایش فایل‌ها
-        run: |
-          echo "📁 فایل‌های دانلود شده:"
-          ls -lh "$OUTPUT_DIR"/*.mp3 2>/dev/null || echo "❌ هیچ فایلی دانلود نشد."
-
-      - name: پاک‌سازی فایل‌های موقت
-        run: |
-          find "$OUTPUT_DIR" -type f -name "*.mp3" -size -10240c -delete 2>/dev/null || true
-          rm -f cookies.txt
+        run: ls -lh "$OUTPUT_DIR"
 
       - name: Commit و Push
         if: always()
         run: |
+          find "$OUTPUT_DIR" -name "*.mp3" -size -10240c -delete
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
           git add "$OUTPUT_DIR/"
