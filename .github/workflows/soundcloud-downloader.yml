@@ -32,23 +32,10 @@ jobs:
           pip3 install scdl
           echo "✅ scdl installed"
 
-      - name: Create scdl config
-        run: |
-          mkdir -p ~/.config/scdl
-          cat > ~/.config/scdl/scdl.cfg << 'EOF'
-          [scdl]
-          auth_token = ${{ secrets.SC_AUTH_TOKEN }}
-          path = ./music-downloads
-          name_format = {user[username]} - {title}
-          only_mp3 = true
-          no_original = true
-          continue = true
-          EOF
-          echo "✅ Config created"
-
       - name: Download from SoundCloud
         env:
           SC_URL: ${{ github.event.inputs.url }}
+          SC_AUTH_TOKEN: ${{ secrets.SC_AUTH_TOKEN }}
         run: |
           mkdir -p $OUTPUT_DIR
           
@@ -57,19 +44,92 @@ jobs:
           
           cd $OUTPUT_DIR
           
-          scdl -l "$SC_URL" --onlymp3
+          # Try multiple methods
+          scdl \
+            -l "$SC_URL" \
+            --auth-token="$SC_AUTH_TOKEN" \
+            --onlymp3 \
+            --name-format="{user[username]} - {title}" \
+            --no-original \
+            --debug 2>&1 || echo "First attempt finished with warning"
           
           echo ""
-          echo "✅ Download complete!"
-          echo ""
           echo "📁 Files:"
-          ls -lh *.mp3 2>/dev/null
+          ls -lh *.mp3 2>/dev/null || echo "No MP3 files"
+          
+          # Check if files are valid
+          for f in *.mp3; do
+            if [ -f "$f" ]; then
+              SIZE=$(stat -c%s "$f")
+              if [ "$SIZE" -lt 10000 ]; then
+                echo "⚠️ $f is too small ($SIZE bytes), probably invalid"
+                rm "$f"
+              else
+                echo "✅ $f ($(echo "scale=1; $SIZE/1048576" | bc)MB)"
+              fi
+            fi
+          done
+
+      - name: Fallback - Direct API download
+        env:
+          SC_URL: ${{ github.event.inputs.url }}
+          SC_AUTH_TOKEN: ${{ secrets.SC_AUTH_TOKEN }}
+        run: |
+          # Check if any valid file was downloaded
+          VALID_FILES=$(find $OUTPUT_DIR -name "*.mp3" -size +10k 2>/dev/null | wc -l)
+          
+          if [ "$VALID_FILES" -eq 0 ]; then
+            echo "⚠️ scdl failed, trying direct download with FFmpeg..."
+            
+            # Get track info
+            CLIENT_ID="a3e059563d7fd3372b49b37f00a00bcf"
+            RESOLVE_URL="https://api-v2.soundcloud.com/resolve?url=${SC_URL}&client_id=${CLIENT_ID}"
+            
+            TRACK_DATA=$(curl -s -H "Authorization: OAuth $SC_AUTH_TOKEN" "$RESOLVE_URL")
+            
+            TITLE=$(echo "$TRACK_DATA" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('title','unknown'))")
+            ARTIST=$(echo "$TRACK_DATA" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['user']['username'])")
+            
+            echo "Title: $TITLE"
+            echo "Artist: $ARTIST"
+            
+            # Get stream URL (try progressive first)
+            STREAM_URL=$(echo "$TRACK_DATA" | python3 -c "
+            import sys, json
+            d = json.load(sys.stdin)
+            transcodings = d.get('media', {}).get('transcodings', [])
+            for t in transcodings:
+                if t['format']['protocol'] == 'progressive':
+                    print(t['url'])
+                    break
+            ")
+            
+            if [ -n "$STREAM_URL" ]; then
+              # Get actual URL
+              ACTUAL_URL=$(curl -s -H "Authorization: OAuth $SC_AUTH_TOKEN" "${STREAM_URL}?client_id=${CLIENT_ID}" | python3 -c "import sys,json; print(json.load(sys.stdin)['url'])")
+              
+              # Download with FFmpeg
+              FILENAME=$(echo "${ARTIST} - ${TITLE}" | sed 's/[<>:"/\\|?*]/_/g')
+              ffmpeg -i "$ACTUAL_URL" -c:a libmp3lame -b:a 320k -ar 44100 -metadata title="$TITLE" -metadata artist="$ARTIST" "${OUTPUT_DIR}/${FILENAME}.mp3"
+              
+              if [ -f "${OUTPUT_DIR}/${FILENAME}.mp3" ]; then
+                SIZE=$(stat -c%s "${OUTPUT_DIR}/${FILENAME}.mp3")
+                echo "✅ Downloaded: ${FILENAME}.mp3 ($(echo "scale=1; $SIZE/1048576" | bc)MB)"
+              fi
+            else
+              echo "❌ No progressive stream available for this track"
+            fi
+          fi
 
       - name: Commit and push
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT || github.token }}@github.com/${{ github.repository }}.git
+          
+          # Remove invalid files
+          find $OUTPUT_DIR -name "*.mp3" -size -10k -delete 2>/dev/null || true
+          find $OUTPUT_DIR -name "*.json" -size -1k -delete 2>/dev/null || true
           
           git add $OUTPUT_DIR/
           
@@ -78,5 +138,5 @@ jobs:
           else
             git commit -m "🎵 $(date +%Y-%m-%d_%H-%M-%S)"
             git push
-            echo "✅ Files committed to repository!"
+            echo "✅ Committed!"
           fi
