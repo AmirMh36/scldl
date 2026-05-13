@@ -1,0 +1,164 @@
+# .github/workflows/soundcloud-downloader.yml
+name: SoundCloud Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'SoundCloud track or playlist URL'
+        required: true
+        type: string
+      type:
+        description: 'Type (track or playlist)'
+        required: true
+        type: choice
+        options:
+          - track
+          - playlist
+        default: 'track'
+
+env:
+  OUTPUT_DIR: downloads
+  NODE_VERSION: '20'
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Create project and install dependency
+        run: |
+          mkdir -p sc-downloader
+          cd sc-downloader
+          npm init -y
+          npm install @snwfdhmp/soundcloud-downloader
+
+      - name: Create download script
+        run: |
+          cat > sc-downloader/download.js << 'SCRIPT_EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const scdl = require('@snwfdhmp/soundcloud-downloader').default;
+
+          const URL = process.env.SC_URL;
+          const TYPE = process.env.SC_TYPE;
+          const OUTPUT_DIR = process.env.OUTPUT_DIR || 'downloads';
+
+          if (!fs.existsSync(OUTPUT_DIR)) {
+            fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+          }
+
+          // clean filename helper
+          function cleanName(str, maxLen = 80) {
+            return str
+              .replace(/[<>:"/\\|?*]/g, '')
+              .replace(/['']/g, "'")
+              .replace(/[""]/g, '"')
+              .trim()
+              .substring(0, maxLen);
+          }
+
+          async function downloadSingleTrack(trackUrl) {
+            const info = await scdl.getInfo(trackUrl);
+            const fileName = cleanName(`${info.user.username} - ${info.title}`) + '.mp3';
+            const filePath = path.join(OUTPUT_DIR, fileName);
+
+            console.log(`  ⬇ ${info.user.username} - ${info.title}`);
+
+            const stream = await scdl.download(trackUrl);
+            const writeStream = fs.createWriteStream(filePath);
+            stream.pipe(writeStream);
+
+            await new Promise((resolve, reject) => {
+              writeStream.on('finish', resolve);
+              writeStream.on('error', reject);
+            });
+
+            console.log(`  ✓ Saved: ${fileName}`);
+            return { fileName, info };
+          }
+
+          async function main() {
+            console.log(`\n🎵 SoundCloud Downloader`);
+            console.log(`   Type: ${TYPE}`);
+            console.log(`   URL:  ${URL}\n`);
+
+            const results = [];
+
+            if (TYPE === 'track') {
+              const result = await downloadSingleTrack(URL);
+              results.push(result);
+            } else if (TYPE === 'playlist') {
+              console.log('📋 Fetching playlist info...');
+              const playlist = await scdl.getSetInfo(URL);
+              console.log(`   Found: ${playlist.title} (${playlist.tracks.length} tracks)\n`);
+
+              for (let i = 0; i < playlist.tracks.length; i++) {
+                console.log(`[${i + 1}/${playlist.tracks.length}]`);
+                const result = await downloadSingleTrack(playlist.tracks[i].permalink_url);
+                results.push(result);
+              }
+            }
+
+            // write summary
+            const summary = {
+              downloadedAt: new Date().toISOString(),
+              sourceUrl: URL,
+              type: TYPE,
+              totalTracks: results.length,
+              files: results.map((r) => ({
+                file: r.fileName,
+                title: r.info.title,
+                artist: r.info.user.username,
+                duration: r.info.duration,
+              })),
+            };
+
+            fs.writeFileSync(
+              path.join(OUTPUT_DIR, 'download-summary.json'),
+              JSON.stringify(summary, null, 2)
+            );
+
+            console.log(`\n✅ Done! ${results.length} file(s) downloaded.`);
+          }
+
+          main().catch((err) => {
+            console.error('❌ Fatal error:', err.message);
+            process.exit(1);
+          });
+          SCRIPT_EOF
+
+      - name: Run downloader
+        working-directory: sc-downloader
+        env:
+          SC_URL: ${{ github.event.inputs.url }}
+          SC_TYPE: ${{ github.event.inputs.type }}
+        run: node download.js
+
+      - name: Upload downloaded files
+        uses: actions/upload-artifact@v4
+        with:
+          name: soundcloud-downloads-${{ github.run_id }}
+          path: sc-downloader/downloads/
+          retention-days: 7
+          compression-level: 0
+
+      - name: Show summary
+        run: |
+          if [ -f sc-downloader/downloads/download-summary.json ]; then
+            echo "## 📊 Download Summary" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat sc-downloader/downloads/download-summary.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "📥 [Download Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          fi
