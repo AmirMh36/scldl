@@ -1,0 +1,92 @@
+# .github/workflows/soundcloud-test.yml
+name: SoundCloud Debug Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'SoundCloud URL to test'
+        required: true
+        type: string
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Test SoundCloud API
+        env:
+          SC_URL: ${{ github.event.inputs.url }}
+        run: |
+          echo "🔍 Testing URL: $SC_URL"
+          echo ""
+          
+          # Test 1: Check if the page is accessible
+          echo "=== Test 1: HTTP Status ==="
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$SC_URL")
+          echo "HTTP Status: $HTTP_CODE"
+          
+          # Test 2: Try to get Client ID from page
+          echo ""
+          echo "=== Test 2: Extract Client ID ==="
+          CLIENT_ID=$(curl -s "$SC_URL" | grep -oP 'client_id:\s*"\K[^"]+' | head -1)
+          echo "Client ID: ${CLIENT_ID:-not found}"
+          
+          # Test 3: Resolve with API v2
+          echo ""
+          echo "=== Test 3: API v2 Resolve ==="
+          CLIENT_ID="a3e059563d7fd3372b49b37f00a00bcf"
+          RESOLVE_URL="https://api-v2.soundcloud.com/resolve?url=${SC_URL}&client_id=${CLIENT_ID}"
+          
+          API_RESPONSE=$(curl -s -w "\n%{http_code}" "$RESOLVE_URL")
+          HTTP_CODE=$(echo "$API_RESPONSE" | tail -1)
+          BODY=$(echo "$API_RESPONSE" | head -n -1)
+          
+          echo "API Status: $HTTP_CODE"
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ API v2 resolved successfully"
+            
+            # Extract info
+            TITLE=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('title','N/A'))" 2>/dev/null || echo "N/A")
+            ARTIST=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('user',{}).get('username','N/A'))" 2>/dev/null || echo "N/A")
+            HAS_MEDIA=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print('transcodings' in d.get('media',{}))" 2>/dev/null || echo "false")
+            DOWNLOADABLE=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('downloadable', False))" 2>/dev/null || echo "false")
+            
+            echo "  Title: $TITLE"
+            echo "  Artist: $ARTIST"
+            echo "  Has Streams: $HAS_MEDIA"
+            echo "  Downloadable: $DOWNLOADABLE"
+            
+            # Check stream types
+            echo ""
+            echo "=== Available Streams ==="
+            echo "$BODY" | python3 -c "
+            import sys, json
+            d = json.load(sys.stdin)
+            for t in d.get('media',{}).get('transcodings',[]):
+                print(f\"  - {t['format']['protocol']}: {t['format']['mime_type']}\")
+            " 2>/dev/null
+            
+          elif [ "$HTTP_CODE" = "404" ]; then
+            echo "❌ Track not found (404)"
+          elif [ "$HTTP_CODE" = "401" ]; then
+            echo "❌ Authentication required (401)"
+          elif [ "$HTTP_CODE" = "403" ]; then
+            echo "❌ Access forbidden (403) - Track is private/blocked"
+          else
+            echo "❌ Unexpected status: $HTTP_CODE"
+          fi
+          
+          # Test 4: Check if it's a private track
+          echo ""
+          echo "=== Test 4: Check Restrictions ==="
+          TRACK_DATA=$(curl -s "https://api.soundcloud.com/tracks/2296239989?client_id=${CLIENT_ID}")
+          SHARING=$(echo "$TRACK_DATA" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sharing','unknown'))" 2>/dev/null || echo "unknown")
+          POLICY=$(echo "$TRACK_DATA" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('policy','unknown'))" 2>/dev/null || echo "unknown")
+          echo "  Sharing: $SHARING"
+          echo "  Policy: $POLICY"
+          
+          echo ""
+          echo "=== Done ==="
