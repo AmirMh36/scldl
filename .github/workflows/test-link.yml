@@ -1,92 +1,159 @@
-# .github/workflows/soundcloud-test.yml
-name: SoundCloud Debug Test
+# .github/workflows/soundcloud-search.yml
+name: SoundCloud Search & Download
 
 on:
   workflow_dispatch:
     inputs:
-      url:
-        description: 'SoundCloud URL to test'
+      query:
+        description: 'Search query'
         required: true
+        type: string
+      limit:
+        description: 'Number of results'
+        required: false
+        default: '5'
         type: string
 
 jobs:
-  debug:
+  search:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
+    permissions:
+      contents: write
 
     steps:
-      - name: Test SoundCloud API
-        env:
-          SC_URL: ${{ github.event.inputs.url }}
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Setup Node.js and FFmpeg
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
         run: |
-          echo "🔍 Testing URL: $SC_URL"
-          echo ""
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          npm install btch-downloader
+          echo "✅ Ready"
+
+      - name: Search SoundCloud
+        env:
+          QUERY: ${{ github.event.inputs.query }}
+          LIMIT: ${{ github.event.inputs.limit }}
+        run: |
+          mkdir -p search-results
           
-          # Test 1: Check if the page is accessible
-          echo "=== Test 1: HTTP Status ==="
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$SC_URL")
-          echo "HTTP Status: $HTTP_CODE"
+          cat > search.js << 'SCRIPT'
+          const fs = require('fs');
+          const https = require('https');
+
+          const query = process.env.QUERY;
+          const limit = parseInt(process.env.LIMIT) || 5;
+          const clientId = 'a3e059563d7fd3372b49b37f00a00bcf';
+
+          const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=${limit}`;
+
+          console.log('🔍 Searching SoundCloud...');
+          console.log(`Query: "${query}"`);
+          console.log('');
+
+          https.get(searchUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+              try {
+                const json = JSON.parse(data);
+                const tracks = json.collection || [];
+
+                if (tracks.length === 0) {
+                  console.log('❌ No results found');
+                  process.exit(0);
+                }
+
+                console.log(`📊 Found ${tracks.length} results:\n`);
+
+                const results = tracks.map((track, i) => {
+                  const title = track.title || 'Unknown';
+                  const artist = track.user?.username || 'Unknown';
+                  const url = track.permalink_url || '';
+                  const duration = Math.floor((track.duration || 0) / 1000);
+                  const mins = Math.floor(duration / 60);
+                  const secs = duration % 60;
+                  const plays = (track.playback_count || 0).toLocaleString();
+                  const genre = track.genre || 'N/A';
+
+                  console.log(`${i + 1}. ${artist} - ${title}`);
+                  console.log(`   ⏱ ${mins}:${secs.toString().padStart(2,'0')} | ▶ ${plays} plays | 🏷 ${genre}`);
+                  console.log(`   🔗 ${url}`);
+                  console.log('');
+
+                  return {
+                    index: i + 1,
+                    title,
+                    artist,
+                    url,
+                    duration: `${mins}:${secs.toString().padStart(2,'0')}`,
+                    plays,
+                    genre,
+                    artwork: track.artwork_url || track.user?.avatar_url || ''
+                  };
+                });
+
+                // Save results
+                const output = {
+                  query,
+                  date: new Date().toISOString(),
+                  total: tracks.length,
+                  results
+                };
+
+                fs.writeFileSync('search-results/search.json', JSON.stringify(output, null, 2));
+                console.log('✅ Results saved to search-results/search.json');
+
+                // Also save as readable text
+                let text = `SoundCloud Search: "${query}"\n`;
+                text += '='.repeat(50) + '\n\n';
+                results.forEach(r => {
+                  text += `${r.index}. ${r.artist} - ${r.title}\n`;
+                  text += `   Duration: ${r.duration} | Plays: ${r.plays}\n`;
+                  text += `   URL: ${r.url}\n\n`;
+                });
+                fs.writeFileSync('search-results/search.txt', text);
+
+              } catch (err) {
+                console.error('❌ Parse error:', err.message);
+                console.log('Raw response:', data.substring(0, 500));
+              }
+            });
+          }).on('error', (err) => {
+            console.error('❌ Request error:', err.message);
+          });
+          SCRIPT
           
-          # Test 2: Try to get Client ID from page
-          echo ""
-          echo "=== Test 2: Extract Client ID ==="
-          CLIENT_ID=$(curl -s "$SC_URL" | grep -oP 'client_id:\s*"\K[^"]+' | head -1)
-          echo "Client ID: ${CLIENT_ID:-not found}"
-          
-          # Test 3: Resolve with API v2
-          echo ""
-          echo "=== Test 3: API v2 Resolve ==="
-          CLIENT_ID="a3e059563d7fd3372b49b37f00a00bcf"
-          RESOLVE_URL="https://api-v2.soundcloud.com/resolve?url=${SC_URL}&client_id=${CLIENT_ID}"
-          
-          API_RESPONSE=$(curl -s -w "\n%{http_code}" "$RESOLVE_URL")
-          HTTP_CODE=$(echo "$API_RESPONSE" | tail -1)
-          BODY=$(echo "$API_RESPONSE" | head -n -1)
-          
-          echo "API Status: $HTTP_CODE"
-          
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "✅ API v2 resolved successfully"
-            
-            # Extract info
-            TITLE=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('title','N/A'))" 2>/dev/null || echo "N/A")
-            ARTIST=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('user',{}).get('username','N/A'))" 2>/dev/null || echo "N/A")
-            HAS_MEDIA=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print('transcodings' in d.get('media',{}))" 2>/dev/null || echo "false")
-            DOWNLOADABLE=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('downloadable', False))" 2>/dev/null || echo "false")
-            
-            echo "  Title: $TITLE"
-            echo "  Artist: $ARTIST"
-            echo "  Has Streams: $HAS_MEDIA"
-            echo "  Downloadable: $DOWNLOADABLE"
-            
-            # Check stream types
-            echo ""
-            echo "=== Available Streams ==="
-            echo "$BODY" | python3 -c "
-            import sys, json
-            d = json.load(sys.stdin)
-            for t in d.get('media',{}).get('transcodings',[]):
-                print(f\"  - {t['format']['protocol']}: {t['format']['mime_type']}\")
-            " 2>/dev/null
-            
-          elif [ "$HTTP_CODE" = "404" ]; then
-            echo "❌ Track not found (404)"
-          elif [ "$HTTP_CODE" = "401" ]; then
-            echo "❌ Authentication required (401)"
-          elif [ "$HTTP_CODE" = "403" ]; then
-            echo "❌ Access forbidden (403) - Track is private/blocked"
-          else
-            echo "❌ Unexpected status: $HTTP_CODE"
+          node search.js
+
+      - name: Show results
+        run: |
+          if [ -f search-results/search.txt ]; then
+            echo "📋 Search Results:"
+            cat search-results/search.txt
           fi
+
+      - name: Commit results
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git remote set-url origin https://x-access-token:${{ secrets.GH_PAT || github.token }}@github.com/${{ github.repository }}.git
           
-          # Test 4: Check if it's a private track
-          echo ""
-          echo "=== Test 4: Check Restrictions ==="
-          TRACK_DATA=$(curl -s "https://api.soundcloud.com/tracks/2296239989?client_id=${CLIENT_ID}")
-          SHARING=$(echo "$TRACK_DATA" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sharing','unknown'))" 2>/dev/null || echo "unknown")
-          POLICY=$(echo "$TRACK_DATA" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('policy','unknown'))" 2>/dev/null || echo "unknown")
-          echo "  Sharing: $SHARING"
-          echo "  Policy: $POLICY"
+          git add search-results/
           
-          echo ""
-          echo "=== Done ==="
+          if git diff --staged --quiet; then
+            echo "No changes"
+          else
+            git commit -m "🔍 Search: ${{ github.event.inputs.query }}"
+            git push
+            echo "✅ Results committed!"
+          fi
