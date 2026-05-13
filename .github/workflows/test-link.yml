@@ -49,6 +49,9 @@ jobs:
 
           const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+          // Generate random si
+          const randomSi = () => Array.from({length: 32}, () => Math.floor(Math.random() * 16).toString(16)).join('');
+
           (async () => {
             const artist = process.env.ARTIST.trim();
             const song = process.env.SONG.trim();
@@ -66,7 +69,7 @@ jobs:
             const page = await browser.newPage();
             await page.setViewport({ width: 1280, height: 900 });
             
-            // Search directly for tracks
+            // Search tracks
             const searchUrl = `https://soundcloud.com/search/tracks?q=${encodeURIComponent(query)}`;
             console.log(`🔗 ${searchUrl}\n`);
             
@@ -74,7 +77,7 @@ jobs:
             await sleep(3000);
             
             // Scroll to load more
-            console.log('📜 Loading more tracks...');
+            console.log('📜 Loading tracks...');
             let lastHeight = 0;
             for (let i = 0; i < 15; i++) {
               const newHeight = await page.evaluate(() => {
@@ -83,83 +86,49 @@ jobs:
               });
               if (newHeight === lastHeight) break;
               lastHeight = newHeight;
-              await sleep(2000);
+              await sleep(1500);
             }
             
-            // Extract track info and get share links
-            console.log('\n🔍 Getting share links...\n');
+            // Extract tracks directly from search results
+            console.log('\n🔍 Extracting tracks...\n');
             
-            const tracks = [];
-            const items = await page.$$('li.searchList__item, article.audible, li[class*="trackList"]');
-            
-            for (const item of items.slice(0, limit)) {
-              try {
-                // Get basic info
-                const titleEl = await item.$('a[class*="soundTitle__title"], a[class*="title"]');
-                const artistEl = await item.$('a[class*="soundTitle__username"], a[class*="owner"]');
-                const imgEl = await item.$('img[src*="sndcdn"]');
-                const durEl = await item.$('span[class*="duration"], div[class*="duration"]');
-                
-                const title = titleEl ? await page.evaluate(el => el.textContent.trim(), titleEl) : '';
-                const trackArtist = artistEl ? await page.evaluate(el => el.textContent.trim(), artistEl) : artist;
-                const duration = durEl ? await page.evaluate(el => el.textContent.trim(), durEl) : '';
-                
-                let thumbnail = '';
-                if (imgEl) {
-                  thumbnail = await page.evaluate(el => el.getAttribute('src'), imgEl);
-                  thumbnail = thumbnail.replace(/t\d+x\d+/, 't500x500');
-                }
-                
-                if (!title) continue;
-                
-                // Click Share button
-                let shareUrl = '';
+            const tracks = await page.evaluate(() => {
+              const results = [];
+              const items = document.querySelectorAll('li.searchList__item');
+              
+              items.forEach((item) => {
                 try {
-                  const shareBtn = await item.$('button[class*="share"], button[title*="Share"], a[class*="share"]');
-                  if (shareBtn) {
-                    await shareBtn.click();
-                    await sleep(1000);
-                    
-                    // Get share input value
-                    const shareInput = await page.$('input[class*="shareLink"], input[value*="soundcloud.com"]');
-                    if (shareInput) {
-                      shareUrl = await page.evaluate(el => el.value, shareInput);
-                    }
-                    
-                    // Close share popup
-                    const closeBtn = await page.$('button[class*="close"], button[class*="dismiss"]');
-                    if (closeBtn) await closeBtn.click();
-                    await sleep(500);
+                  // Title
+                  const titleEl = item.querySelector('a[class*="soundTitle__title"]');
+                  // Artist  
+                  const artistEl = item.querySelector('a[class*="soundTitle__username"]');
+                  // Link
+                  const linkEl = item.querySelector('a[href^="/"][href*="/"]');
+                  // Thumbnail
+                  const imgEl = item.querySelector('img');
+                  // Duration
+                  const durEl = item.querySelector('span[class*="duration"], .sc-visuallyhidden');
+                  
+                  const title = titleEl ? titleEl.textContent.trim() : '';
+                  const trackArtist = artistEl ? artistEl.textContent.trim() : '';
+                  const href = linkEl ? linkEl.getAttribute('href') : '';
+                  const thumbnail = imgEl ? imgEl.getAttribute('src') : '';
+                  const duration = durEl ? durEl.textContent.trim() : '';
+                  
+                  if (title && href && href.split('/').length >= 2) {
+                    results.push({
+                      title,
+                      artist: trackArtist,
+                      url: `https://soundcloud.com${href.split('?')[0]}`,
+                      thumbnail: thumbnail.replace(/t\d+x\d+/, 't500x500'),
+                      duration
+                    });
                   }
                 } catch(e) {}
-                
-                // Fallback: build URL from href
-                if (!shareUrl) {
-                  const linkEl = await item.$('a[href^="/"][href*="/"]');
-                  if (linkEl) {
-                    const href = await page.evaluate(el => el.getAttribute('href'), linkEl);
-                    if (href) {
-                      shareUrl = `https://soundcloud.com${href.split('?')[0]}?utm_source=clipboard&utm_medium=text&utm_campaign=social_sharing`;
-                    }
-                  }
-                }
-                
-                if (shareUrl) {
-                  tracks.push({
-                    title,
-                    artist: trackArtist || artist,
-                    shareUrl,
-                    duration,
-                    thumbnail
-                  });
-                  
-                  console.log(`${tracks.length}. ${trackArtist || artist} — ${title}`);
-                  console.log(`   ⏱ ${duration || '—'}`);
-                  console.log(`   🔗 ${shareUrl}\n`);
-                }
-                
-              } catch(e) {}
-            }
+              });
+              
+              return results;
+            });
             
             await browser.close();
             
@@ -170,42 +139,59 @@ jobs:
               process.exit(0);
             }
             
-            console.log(`\n✅ ${tracks.length} tracks extracted\n`);
+            // Deduplicate and add share URLs
+            const unique = [];
+            const seen = new Set();
+            for (const t of tracks) {
+              const key = t.url.toLowerCase();
+              if (!seen.has(key)) {
+                seen.add(key);
+                // Add share URL with random si
+                t.shareUrl = `${t.url}?si=${randomSi()}&utm_source=clipboard&utm_medium=text&utm_campaign=social_sharing`;
+                unique.push(t);
+              }
+            }
+            
+            const finalTracks = unique.slice(0, limit);
+            finalTracks.forEach((t, i) => t.index = i + 1);
+            
+            console.log(`✅ ${finalTracks.length} tracks\n`);
+            finalTracks.forEach(t => {
+              console.log(`${t.index}. ${t.artist} — ${t.title}`);
+              console.log(`   🔗 ${t.shareUrl}\n`);
+            });
             
             // Save files
             const dir = `results/${artist}`;
             fs.mkdirSync(dir, { recursive: true });
             
             // README.md
-            let md = `<div align="center">\n\n# 🎵 ${artist}\n\n**${tracks.length} tracks**\n\n</div>\n\n`;
+            let md = `<div align="center">\n\n# 🎵 ${artist}\n\n**${finalTracks.length} tracks**\n\n</div>\n\n`;
             md += '<table>\n';
             md += '<tr><th>#</th><th>Cover</th><th>Track</th><th>Duration</th><th>Share Link</th></tr>\n';
             
-            let linksTxt = `# ${artist} — SoundCloud Share Links\n`;
-            linksTxt += `# Total: ${tracks.length} tracks\n\n`;
+            let linksTxt = `# ${artist}\n# Total: ${finalTracks.length} tracks\n\n`;
             
             let jsonTracks = [];
             
-            tracks.forEach((t, i) => {
-              t.index = i + 1;
-              
-              const coverHtml = t.thumbnail
+            finalTracks.forEach(t => {
+              const cover = t.thumbnail
                 ? `<img src="${t.thumbnail}" width="80" height="80" style="border-radius:8px">`
-                : '<div style="width:80px;height:80px;background:#333;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#666">🎵</div>';
+                : '🎵';
               
               md += `<tr>\n`;
               md += `<td align="center">${t.index}</td>\n`;
-              md += `<td align="center">${coverHtml}</td>\n`;
-              md += `<td><strong>${t.artist} — ${t.title}</strong></td>\n`;
+              md += `<td align="center">${cover}</td>\n`;
+              md += `<td><strong>${t.artist || artist} — ${t.title}</strong></td>\n`;
               md += `<td align="center"><code>${t.duration || '—'}</code></td>\n`;
               md += `<td align="center"><a href="${t.shareUrl}" target="_blank">🔗 Share</a></td>\n`;
               md += `</tr>\n`;
               
-              linksTxt += `${t.index}. ${t.artist} — ${t.title}\n${t.shareUrl}\n\n`;
+              linksTxt += `${t.shareUrl}\n`;
               
               jsonTracks.push({
                 index: t.index,
-                artist: t.artist,
+                artist: t.artist || artist,
                 title: t.title,
                 shareUrl: t.shareUrl,
                 duration: t.duration,
@@ -213,20 +199,14 @@ jobs:
               });
             });
             
-            md += '</table>\n\n---\n\n## 📋 All Share Links\n\n';
+            md += '</table>\n\n---\n\n## 📋 Share Links\n\n';
             jsonTracks.forEach(t => {
-              md += `**${t.index}.** [${t.artist} — ${t.title}](${t.shareUrl}) \`${t.duration}\`\n\n`;
+              md += `- [**${t.artist} — ${t.title}**](${t.shareUrl}) \`${t.duration}\`\n`;
             });
-            md += `\n---\n\n*Generated: ${new Date().toISOString()}*`;
             
             fs.writeFileSync(`${dir}/README.md`, md);
             fs.writeFileSync(`${dir}/links.txt`, linksTxt);
-            fs.writeFileSync(`${dir}/links.json`, JSON.stringify({
-              artist, query,
-              total: tracks.length,
-              date: new Date().toISOString(),
-              tracks: jsonTracks
-            }, null, 2));
+            fs.writeFileSync(`${dir}/links.json`, JSON.stringify({ artist, query, total: finalTracks.length, date: new Date().toISOString(), tracks: jsonTracks }, null, 2));
             
             console.log(`✅ Saved to ${dir}/`);
 
@@ -236,10 +216,7 @@ jobs:
           node search.js
 
       - name: Show links
-        run: |
-          ARTIST="${{ github.event.inputs.artist }}"
-          echo ""
-          cat "results/$ARTIST/links.txt" 2>/dev/null || echo "No results"
+        run: cat results/${{ github.event.inputs.artist }}/links.txt 2>/dev/null || echo "No results"
 
       - name: Commit
         run: |
