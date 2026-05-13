@@ -25,135 +25,142 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Setup dependencies
+      - name: Setup
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg python3-pip
-          pip3 install soundcloud-v2 yt-dlp
-          echo "✅ Dependencies ready"
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install yt-dlp
+          echo "✅ Ready"
 
       - name: Download from SoundCloud
         env:
           SC_URL: ${{ github.event.inputs.url }}
-          SC_AUTH_TOKEN: ${{ secrets.SC_AUTH_TOKEN }}
         run: |
           mkdir -p "$OUTPUT_DIR"
           
-          # Python script to download
-          cat > /tmp/download.py << 'PYEOF'
-          import sys, os, json, subprocess, requests
-
-          url = os.environ['SC_URL']
-          auth_token = os.environ.get('SC_AUTH_TOKEN', '')
-          output_dir = os.environ['OUTPUT_DIR']
-          client_id = 'a3e059563d7fd3372b49b37f00a00bcf'
-
-          print(f'🎵 Downloading: {url}')
-          print()
-
-          try:
-              # Resolve track
-              resolve_url = f'https://api-v2.soundcloud.com/resolve?url={url}&client_id={client_id}'
-              headers = {'Authorization': f'OAuth {auth_token}'} if auth_token else {}
-              
-              r = requests.get(resolve_url, headers=headers)
-              track = r.json()
-              
-              title = track.get('title', 'Unknown')
-              artist = track.get('user', {}).get('username', 'Unknown')
-              
-              print(f'Title: {title}')
-              print(f'Artist: {artist}')
-              
-              # Get stream URL
-              transcodings = track.get('media', {}).get('transcodings', [])
-              stream_info = None
-              
-              for t in transcodings:
-                  protocol = t.get('format', {}).get('protocol', '')
-                  if protocol == 'progressive':
-                      stream_info = t
-                      break
-              
-              if not stream_info and transcodings:
-                  stream_info = transcodings[0]
-              
-              if not stream_info:
-                  print('❌ No stream available')
-                  sys.exit(1)
-              
-              stream_url = stream_info.get('url', '')
-              print(f'Stream type: {stream_info.get("format", {}).get("protocol", "unknown")}')
-              
-              # Get actual download URL
-              r2 = requests.get(f'{stream_url}?client_id={client_id}', headers=headers)
-              actual_url = r2.json().get('url', '')
-              
-              if not actual_url:
-                  print('❌ Could not get actual URL')
-                  sys.exit(1)
-              
-              print('Downloading...')
-              
-              # Safe filename
-              safe_name = f'{artist} - {title}'.replace('/', '_')[:100]
-              output_file = os.path.join(output_dir, f'{safe_name}.mp3')
-              
-              # Download with FFmpeg
-              cmd = [
-                  'ffmpeg',
-                  '-i', actual_url,
-                  '-c:a', 'libmp3lame',
-                  '-b:a', '320k',
-                  '-ar', '44100',
-                  '-metadata', f'title={title}',
-                  '-metadata', f'artist={artist}',
-                  '-y',
-                  '-nostdin',
-                  '-loglevel', 'error',
-                  output_file
-              ]
-              
-              result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-              
-              if result.returncode == 0 and os.path.exists(output_file):
-                  size_mb = os.path.getsize(output_file) / (1024 * 1024)
-                  print(f'✅ Downloaded: {safe_name}.mp3 ({size_mb:.1f}MB)')
-              else:
-                  print(f'❌ FFmpeg failed: {result.stderr[:200]}')
-                  sys.exit(1)
-                  
-          except Exception as e:
-              print(f'❌ Error: {e}')
-              sys.exit(1)
-          PYEOF
-          
-          python3 /tmp/download.py
-
-      - name: Final check
-        run: |
+          echo "🎵 SoundCloud Download"
+          echo "URL: $SC_URL"
           echo ""
-          echo "📁 Output files:"
-          find "$OUTPUT_DIR" -type f -name "*.mp3" | while read f; do
-            SIZE=$(stat -c%s "$f")
-            echo "  $f ($((SIZE / 1048576))MB)"
+          
+          cd "$OUTPUT_DIR"
+          
+          # Try all formats
+          python3 -m yt_dlp \
+            -f "bestaudio/best" \
+            --extract-audio \
+            --audio-format mp3 \
+            --audio-quality 0 \
+            --embed-metadata \
+            --no-playlist \
+            --no-check-certificate \
+            --prefer-ffmpeg \
+            -o "%(uploader)s - %(title)s.%(ext)s" \
+            "$SC_URL" 2>&1
+          
+          echo ""
+          echo "Files:"
+          ls -lh *.mp3 2>/dev/null || echo "No MP3 files"
+
+      - name: Fallback with cookies
+        if: always()
+        env:
+          SC_URL: ${{ github.event.inputs.url }}
+        run: |
+          cd "$OUTPUT_DIR"
+          
+          # Check if we got valid files
+          VALID=0
+          for f in *.mp3; do
+            [ -f "$f" ] && [ $(stat -c%s "$f") -gt 10000 ] && VALID=1
+          done
+          
+          if [ "$VALID" -eq 0 ]; then
+            echo "First try failed. Trying alternative..."
+            rm -f *.mp3
+            
+            # Try with different options
+            python3 -m yt_dlp \
+              --extract-audio \
+              --audio-format mp3 \
+              --prefer-ffmpeg \
+              --ffmpeg-location /usr/bin/ffmpeg \
+              --no-playlist \
+              --ignore-errors \
+              -o "%(title)s.%(ext)s" \
+              "$SC_URL" 2>&1
+            
+            echo ""
+            echo "Files after fallback:"
+            ls -lh *.* 2>/dev/null
+          fi
+
+      - name: Final attempt with scdl
+        if: always()
+        env:
+          SC_URL: ${{ github.event.inputs.url }}
+        run: |
+          cd "$OUTPUT_DIR"
+          
+          # Final check
+          HAS_MP3=$(find . -name "*.mp3" -size +10k 2>/dev/null | wc -l)
+          
+          if [ "$HAS_MP3" -eq 0 ]; then
+            echo "Previous methods failed. Last attempt with scdl..."
+            
+            pip3 install scdl 2>/dev/null
+            
+            scdl \
+              -l "$SC_URL" \
+              --onlymp3 \
+              --name-format="{title}" \
+              --no-original 2>&1 || echo "scdl also failed"
+            
+            # Check again
+            find . -type f -name "*.mp3" -size +10k | while read f; do
+              echo "✅ Got: $f ($(du -h "$f" | cut -f1))"
+            done
+          fi
+
+      - name: Convert any remaining audio files
+        if: always()
+        run: |
+          cd "$OUTPUT_DIR"
+          
+          # Convert non-MP3 files if any
+          for f in *.m4a *.ogg *.opus *.aac *.wav *.flac 2>/dev/null; do
+            if [ -f "$f" ] && [ $(stat -c%s "$f") -gt 10000 ]; then
+              NAME="${f%.*}"
+              echo "Converting: $f"
+              ffmpeg -nostdin -i "$f" -c:a libmp3lame -b:a 320k "${NAME}.mp3" -y 2>/dev/null && rm "$f"
+            fi
+          done
+          
+          # Show final results
+          echo "📁 Final files:"
+          for f in *.mp3; do
+            [ -f "$f" ] && echo "  ✅ $f ($(du -h "$f" | cut -f1))"
           done
 
       - name: Commit and push
         if: always()
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git remote set-url origin https://x-access-token:${{ secrets.GH_PAT || github.token }}@github.com/${{ github.repository }}.git
+          cd "$OUTPUT_DIR"
+          # Remove invalid files
+          find . -type f -name "*.mp3" -size -10240c -delete
+          find . -type f -name "*.part" -delete
+          find . -type f -name "*.ytdl" -delete
+          cd ..
           
-          find "$OUTPUT_DIR" -type f -name "*.mp3" -size -10k -delete 2>/dev/null || true
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git remote set-url origin https://x-access-token:${{ secrets.GH_PAT || github.token }}@github.com/${{ github.repository }}.git
           
           git add "$OUTPUT_DIR/"
           
           if git diff --staged --quiet; then
-            echo "Nothing to commit"
+            echo "No new files"
           else
             git commit -m "🎵 $(date +%Y-%m-%d_%H-%M-%S)"
             git push
-            echo "✅ Done!"
+            echo "✅ Committed"
           fi
