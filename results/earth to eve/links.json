@@ -1,0 +1,36 @@
+{
+  "artist": "earth to eve",
+  "query": "earth to eve",
+  "total": 4,
+  "date": "2026-05-13T10:14:42.350Z",
+  "tracks": [
+    {
+      "title": "Earth to Eve",
+      "artist": "Earth to Eve",
+      "url": "https://soundcloud.com/earthtoeve/threat-level-orange-1",
+      "thumbnail": "",
+      "index": 1
+    },
+    {
+      "title": "Earth to Eve",
+      "artist": "Earth to Eve",
+      "url": "https://soundcloud.com/earthtoeve/imposter",
+      "thumbnail": "",
+      "index": 2
+    },
+    {
+      "title": "Earth to Eve",
+      "artist": "Earth to Eve",
+      "url": "https://soundcloud.com/earthtoeve/first-generation-degenerate",
+      "thumbnail": "",
+      "index": 3
+    },
+    {
+      "title": "Earth to Eve",
+      "artist": "Earth to Eve",
+      "url": "https://soundcloud.com/earthtoeve/never-change-for-a-man-1",
+      "thumbnail": "",
+      "index": 4
+    }
+  ]
+}
