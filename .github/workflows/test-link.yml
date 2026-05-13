@@ -23,7 +23,6 @@ on:
         type: boolean
         default: false
 
-# رفع هشدار Node.js 20 (اختیاری)
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -60,6 +59,21 @@ jobs:
           const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
           const randomSi = () => Array.from({length: 32}, () => Math.floor(Math.random() * 16).toString(16)).join('');
 
+          // تابع کمکی برای تشخیص URL معتبر آهنگ
+          function isValidTrackUrl(path) {
+            // حذف query string
+            const cleanPath = path.split('?')[0];
+            // باید حداقل دو بخش داشته باشد: /username/track-slug
+            const parts = cleanPath.split('/').filter(Boolean);
+            if (parts.length < 2) return false;
+            // کلمات کلیدی صفحات غیر آهنگ را حذف کن
+            const excludedWords = ['discover', 'feed', 'you', 'search', 'popular', 'tracks', 'playlists', 'albums', 'reposts'];
+            for (const word of excludedWords) {
+              if (parts.includes(word)) return false;
+            }
+            return true;
+          }
+
           (async () => {
             const artist = process.env.ARTIST.trim();
             const song = process.env.SONG.trim();
@@ -92,26 +106,22 @@ jobs:
               console.log('Page loaded.');
               await sleep(4000);
 
-              // تشخیص ساختار
-              const liCount = await page.$$eval('li', items => items.length);
-              console.log(`Total <li> elements: ${liCount}`);
-              if (liCount === 0) {
-                const htmlSample = await page.content();
-                console.log('Page HTML sample:', htmlSample.substring(0, 2000));
+              // اسکرول برای لود نتایج بیشتر (حداکثر ۱۰ بار)
+              for (let i = 0; i < 10; i++) {
+                await page.evaluate(() => window.scrollBy(0, 800));
+                await sleep(1500);
               }
 
-              // استخراج با انتخابگرهای چندگانه
-              tracks = await page.evaluate(() => {
+              // استخراج با انتخابگرهای مختلف و فیلتر دقیق
+              tracks = await page.evaluate((isValid) => {
+                // سعی با انتخابگرهای مختلف برای آیتم‌های جستجو
                 const selectors = [
                   'li.searchList__item',
-                  'li.soundList__item',
+                  'div[class*="searchResult"]',
+                  'li[class*="trackList"]',
                   'article.audible',
-                  'div[class*="trackList"] > div',
-                  'li[class*="track"]',
                   'div.sound__body',
-                  'tr.soundList__item',
-                  'li.searchResult__item',
-                  'div.searchResult__item',
+                  'li[class*="track"]',
                 ];
 
                 let items = [];
@@ -120,14 +130,14 @@ jobs:
                   if (items.length > 0) break;
                 }
 
-                // روش دوم: پیمایش لینک‌های آهنگ
+                // اگر هیچکدام کار نکرد، از تمام لینک‌های موجود استفاده کن
                 if (items.length === 0) {
                   const allLinks = document.querySelectorAll('a[href^="/"][href*="/"]');
                   const seen = new Set();
                   allLinks.forEach(a => {
                     const href = a.getAttribute('href');
-                    if (href && href.split('/').length >= 2 && !href.includes('search') && !href.includes('?')) {
-                      const parent = a.closest('li, article, div[class*="track"], div[class*="item"]');
+                    if (href && isValid(href)) {
+                      const parent = a.closest('li, article, div[class*="track"], div[class*="item"], div[class*="result"]');
                       if (parent && !seen.has(href)) {
                         seen.add(href);
                         items = [...items, parent];
@@ -137,6 +147,7 @@ jobs:
                 }
 
                 const results = [];
+                const seenUrls = new Set();
                 items.forEach(item => {
                   try {
                     const titleEl = item.querySelector('a[class*="title"], a[aria-label], a[href*="/"]');
@@ -146,7 +157,9 @@ jobs:
                     const trackArtist = artistEl ? artistEl.textContent.trim() : '';
                     const href = titleEl ? titleEl.getAttribute('href') : '';
                     const thumbnail = imgEl ? imgEl.getAttribute('src') : '';
-                    if (title && href && href.includes('/')) {
+
+                    if (title && href && isValid(href) && !seenUrls.has(href)) {
+                      seenUrls.add(href);
                       results.push({
                         title,
                         artist: trackArtist,
@@ -157,9 +170,9 @@ jobs:
                   } catch(e) {}
                 });
                 return results;
-              });
+              }, isValidTrackUrl);
 
-              console.log(`Extracted ${tracks.length} tracks.`);
+              console.log(`Extracted ${tracks.length} valid tracks.`);
 
             } catch (err) {
               console.log('Navigation error:', err.message);
