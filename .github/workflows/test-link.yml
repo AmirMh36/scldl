@@ -18,10 +18,10 @@ on:
         type: string
         default: '10'
       use_proxy:
-        description: 'Use free proxy?'
+        description: 'Use free proxy? (may need auth)'
         required: false
         type: boolean
-        default: true
+        default: false
 
 jobs:
   search:
@@ -42,17 +42,15 @@ jobs:
           npm init -y
           npm install puppeteer
 
-      - name: Get free proxy list
+      - name: Get fresh proxy list (optional)
         if: ${{ github.event.inputs.use_proxy == 'true' }}
         run: |
-          echo "Getting fresh proxy list..."
-          curl -s "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all" > proxies.txt || true
-          curl -s "https://www.proxy-list.download/api/v1/get?type=http" >> proxies.txt || true
-          curl -s "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt" >> proxies.txt || true
+          echo "Downloading verified proxy list..."
+          curl -s https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/http.txt > proxies.txt
           echo "Proxies found: $(wc -l < proxies.txt)"
           head -20 proxies.txt
 
-      - name: Search SoundCloud with proxy support
+      - name: Search SoundCloud
         env:
           ARTIST: ${{ github.event.inputs.artist }}
           SONG: ${{ github.event.inputs.song }}
@@ -68,17 +66,10 @@ jobs:
 
           function loadProxies() {
             if (!fs.existsSync('proxies.txt')) return [];
-            const lines = fs.readFileSync('proxies.txt', 'utf8').split('\n');
-            return lines
+            return fs.readFileSync('proxies.txt', 'utf8')
+              .split('\n')
               .map(l => l.trim())
-              .filter(l => l && l.includes(':') && !l.startsWith('#') && !l.startsWith('//'))
-              .map(l => l.replace(/^http:\/\//, '').replace(/^https:\/\//, ''));
-          }
-
-          function getRandomProxy() {
-            const proxies = loadProxies();
-            if (proxies.length === 0) return null;
-            return proxies[Math.floor(Math.random() * proxies.length)];
+              .filter(l => l && l.includes(':') && !l.startsWith('#'));
           }
 
           (async () => {
@@ -88,173 +79,173 @@ jobs:
             const useProxy = process.env.USE_PROXY === 'true';
             const query = song ? `${artist} ${song}` : artist;
             
-            console.log(`🎵 SoundCloud Search`);
-            console.log(`Query: "${query}"`);
+            console.log(`🎵 Search: "${query}"`);
             console.log(`Limit: ${limit}`);
             console.log(`Proxy: ${useProxy ? 'Enabled' : 'Disabled'}\n`);
 
-            // Launch config
             const launchOpts = {
               headless: 'new',
               args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-web-security',
-                '--disable-features=IsolateOrigins,site-per-process',
                 '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
               ]
             };
 
-            // Add proxy if enabled
             let proxyUsed = null;
             if (useProxy) {
-              for (let attempt = 0; attempt < 5; attempt++) {
-                const proxy = getRandomProxy();
-                if (proxy) {
-                  console.log(`Proxy attempt ${attempt + 1}: ${proxy}`);
-                  launchOpts.args.push(`--proxy-server=http://${proxy}`);
-                  proxyUsed = proxy;
-                  break;
+              const proxies = loadProxies();
+              if (proxies.length > 0) {
+                proxyUsed = proxies[Math.floor(Math.random() * proxies.length)];
+                console.log(`Using proxy: ${proxyUsed}`);
+                launchOpts.args.push(`--proxy-server=http://${proxyUsed}`);
+              } else {
+                console.log('No proxies found, continuing without proxy.');
+              }
+            }
+
+            let browser;
+            try {
+              browser = await puppeteer.launch(launchOpts);
+              const page = await browser.newPage();
+              await page.setViewport({ width: 1280, height: 900 });
+
+              const searchUrl = `https://soundcloud.com/search/tracks?q=${encodeURIComponent(query)}`;
+              console.log(`Opening: ${searchUrl}\n`);
+
+              let tracks = [];
+
+              try {
+                await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 45000 });
+                console.log('Page loaded successfully.');
+                await sleep(4000);
+
+                // Scroll to load more if needed
+                let initialCount = await page.$$eval('li.searchList__item', items => items.length);
+                console.log(`Tracks on first load: ${initialCount}`);
+
+                if (initialCount > 0 && initialCount < limit) {
+                  for (let i = 0; i < 5; i++) {
+                    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+                    await sleep(2000);
+                    let count = await page.$$eval('li.searchList__item', items => items.length);
+                    console.log(`  Scroll ${i+1}: ${count} tracks`);
+                    if (count >= limit) break;
+                  }
+                }
+
+                // Extract tracks
+                tracks = await page.evaluate(() => {
+                  const items = document.querySelectorAll('li.searchList__item');
+                  const results = [];
+                  items.forEach(item => {
+                    try {
+                      const titleEl = item.querySelector('a[class*="soundTitle__title"]');
+                      const artistEl = item.querySelector('a[class*="soundTitle__username"]');
+                      const imgEl = item.querySelector('img');
+                      const title = titleEl ? titleEl.textContent.trim() : '';
+                      const trackArtist = artistEl ? artistEl.textContent.trim() : '';
+                      const href = titleEl ? titleEl.getAttribute('href') : '';
+                      const thumbnail = imgEl ? imgEl.getAttribute('src') : '';
+                      if (title && href) {
+                        results.push({
+                          title,
+                          artist: trackArtist,
+                          url: 'https://soundcloud.com' + href.split('?')[0],
+                          thumbnail: thumbnail.replace(/t\d+x\d+/, 't500x500')
+                        });
+                      }
+                    } catch(e) {}
+                  });
+                  return results;
+                });
+
+                console.log(`Extracted ${tracks.length} tracks from page.`);
+
+              } catch (navErr) {
+                console.log(`Navigation failed: ${navErr.message}`);
+                console.log('Trying fallback API method...');
+              } finally {
+                await browser.close();
+              }
+
+              // If no tracks from page, try API
+              if (tracks.length === 0) {
+                console.log('Attempting API v2 search...');
+                const https = require('https');
+                const clientId = 'a3e059563d7fd3372b49b37f00a00bcf';
+                const apiUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=${limit}`;
+                console.log(`API URL: ${apiUrl}`);
+
+                const apiData = await new Promise((resolve, reject) => {
+                  https.get(apiUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+                    let data = '';
+                    res.on('data', chunk => data += chunk);
+                    res.on('end', () => {
+                      try { resolve(JSON.parse(data)); }
+                      catch(e) { resolve(null); }
+                    });
+                  }).on('error', reject);
+                });
+
+                if (apiData && apiData.collection) {
+                  tracks = apiData.collection.map(t => ({
+                    title: t.title,
+                    artist: t.user?.username || artist,
+                    url: t.permalink_url,
+                    thumbnail: (t.artwork_url || '').replace('large', 't500x500'),
+                    duration: t.duration ? Math.floor(t.duration / 1000) : 0
+                  }));
+                  console.log(`API returned ${tracks.length} tracks.`);
                 }
               }
-              if (!proxyUsed) {
-                console.log('No working proxies found, continuing without proxy...');
+
+              // Process and save results
+              const finalTracks = tracks.slice(0, limit).map((t, i) => ({
+                ...t,
+                shareUrl: t.url + '?si=' + randomSi() + '&utm_source=clipboard&utm_medium=text&utm_campaign=social_sharing',
+                index: i + 1
+              }));
+
+              const dir = `results/${artist}`;
+              fs.mkdirSync(dir, { recursive: true });
+
+              if (finalTracks.length === 0) {
+                fs.writeFileSync(`${dir}/README.md`, `# ${artist}\n\n❌ No results found.`);
+                fs.writeFileSync(`${dir}/links.txt`, 'No results');
+                fs.writeFileSync(`${dir}/links.json`, JSON.stringify({artist, query, total:0}));
+                console.log('No tracks to save.');
+                process.exit(0);
               }
-            }
 
-            const browser = await puppeteer.launch(launchOpts);
-            const page = await browser.newPage();
-            await page.setViewport({ width: 1280, height: 900 });
+              // Save README with covers
+              let md = `<div align="center">\n\n# 🎵 ${artist}\n\n**${finalTracks.length} tracks**\n\n</div>\n\n`;
+              md += '<table>\n<tr><th>#</th><th>Cover</th><th>Track</th><th>Share Link</th></tr>\n';
+              let linksTxt = `# ${artist}\n\n`;
+              let jsonTracks = [];
 
-            // Set extra headers to avoid detection
-            await page.setExtraHTTPHeaders({
-              'Accept-Language': 'en-US,en;q=0.9',
-              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-              'Referer': 'https://soundcloud.com/',
-              'DNT': '1'
-            });
-
-            const searchUrl = `https://soundcloud.com/search/tracks?q=${encodeURIComponent(query)}`;
-            console.log(`Opening: ${searchUrl}\n`);
-
-            try {
-              await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 45000 });
-              console.log('Page loaded!');
-            } catch(e) {
-              console.log(`Page load failed: ${e.message}`);
-              console.log('Trying without proxy...');
-              if (proxyUsed) {
-                await browser.close();
-                launchOpts.args = launchOpts.args.filter(a => !a.startsWith('--proxy-server'));
-                const browser2 = await puppeteer.launch(launchOpts);
-                const page2 = await browser2.newPage();
-                await page2.setViewport({ width: 1280, height: 900 });
-                await page2.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 45000 });
-              }
-            }
-
-            await sleep(4000);
-
-            // Check if we hit a block page
-            const pageTitle = await page.title();
-            console.log(`Page title: ${pageTitle}\n`);
-
-            if (pageTitle.includes('blocked') || pageTitle.includes('captcha')) {
-              console.log('❌ Blocked by SoundCloud! Try with different proxy.');
-              await browser.close();
-              process.exit(1);
-            }
-
-            // Count items
-            const initialCount = await page.$$eval('li.searchList__item', items => items.length);
-            console.log(`Tracks found on first load: ${initialCount}`);
-
-            // Scroll if needed
-            if (initialCount > 0 && initialCount < limit) {
-              for (let i = 0; i < 5; i++) {
-                await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-                await sleep(2000);
-                const count = await page.$$eval('li.searchList__item', items => items.length);
-                console.log(`  Scroll ${i+1}: ${count} tracks`);
-                if (count >= limit) break;
-              }
-            }
-
-            // Extract tracks
-            console.log('\nExtracting...');
-            const tracks = await page.evaluate(() => {
-              const items = document.querySelectorAll('li.searchList__item');
-              const results = [];
-              items.forEach(item => {
-                try {
-                  const titleEl = item.querySelector('a[class*="soundTitle__title"]');
-                  const artistEl = item.querySelector('a[class*="soundTitle__username"]');
-                  const imgEl = item.querySelector('img');
-                  const title = titleEl ? titleEl.textContent.trim() : '';
-                  const trackArtist = artistEl ? artistEl.textContent.trim() : '';
-                  const href = titleEl ? titleEl.getAttribute('href') : '';
-                  const thumbnail = imgEl ? imgEl.getAttribute('src') : '';
-                  if (title && href) {
-                    results.push({
-                      title,
-                      artist: trackArtist,
-                      url: 'https://soundcloud.com' + href.split('?')[0],
-                      thumbnail: thumbnail.replace(/t\d+x\d+/, 't500x500')
-                    });
-                  }
-                } catch(e) {}
+              finalTracks.forEach(t => {
+                const cover = t.thumbnail ? `<img src="${t.thumbnail}" width="80" height="80" style="border-radius:8px">` : '🎵';
+                md += `<tr><td align="center">${t.index}</td><td align="center">${cover}</td><td><strong>${t.artist || artist} — ${t.title}</strong></td><td align="center"><a href="${t.shareUrl}" target="_blank">🔗 Share</a></td></tr>\n`;
+                linksTxt += `${t.shareUrl}\n`;
+                jsonTracks.push(t);
+                console.log(`${t.index}. ${t.artist || artist} — ${t.title}`);
+                console.log(`   🔗 ${t.shareUrl}\n`);
               });
-              return results;
-            });
+              md += '</table>\n\n---\n\n## 📋 Share Links\n\n';
+              jsonTracks.forEach(t => md += `- [${t.artist || artist} — ${t.title}](${t.shareUrl})\n`);
 
-            await browser.close();
+              fs.writeFileSync(`${dir}/README.md`, md);
+              fs.writeFileSync(`${dir}/links.txt`, linksTxt);
+              fs.writeFileSync(`${dir}/links.json`, JSON.stringify({ artist, query, total: finalTracks.length, tracks: jsonTracks, proxyUsed }, null, 2));
+              console.log(`✅ Saved ${finalTracks.length} tracks to ${dir}/`);
+              if (proxyUsed) console.log(`   Proxy used: ${proxyUsed}`);
 
-            console.log(`Extracted ${tracks.length} tracks\n`);
-
-            if (tracks.length === 0) {
-              console.log('❌ No tracks extracted. SoundCloud may be blocking.');
-              fs.mkdirSync(`results/${artist}`, { recursive: true });
-              fs.writeFileSync(`results/${artist}/README.md`, `# ${artist}\n\n❌ No results found. Try enabling proxy or using a different VPN.\n`);
+            } catch (launchErr) {
+              console.error('Browser launch failed:', launchErr.message);
               process.exit(1);
             }
-
-            // Build share URLs & save
-            const finalTracks = tracks.slice(0, limit).map((t, i) => ({
-              ...t,
-              shareUrl: t.url + '?si=' + randomSi() + '&utm_source=clipboard&utm_medium=text&utm_campaign=social_sharing',
-              index: i + 1
-            }));
-
-            const dir = `results/${artist}`;
-            fs.mkdirSync(dir, { recursive: true });
-
-            // README
-            let md = `<div align="center">\n\n# 🎵 ${artist}\n\n**${finalTracks.length} tracks**\n\n</div>\n\n`;
-            md += '<table>\n<tr><th>#</th><th>Cover</th><th>Track</th><th>Share Link</th></tr>\n';
-            let linksTxt = `# ${artist}\n\n`;
-            let jsonTracks = [];
-
-            finalTracks.forEach(t => {
-              const cover = t.thumbnail ? `<img src="${t.thumbnail}" width="80" height="80" style="border-radius:8px">` : '🎵';
-              md += `<tr><td align="center">${t.index}</td><td align="center">${cover}</td><td><strong>${t.artist || artist} — ${t.title}</strong></td><td align="center"><a href="${t.shareUrl}" target="_blank">🔗 Share</a></td></tr>\n`;
-              linksTxt += `${t.shareUrl}\n`;
-              jsonTracks.push(t);
-              console.log(`${t.index}. ${t.artist || artist} — ${t.title}`);
-              console.log(`   🔗 ${t.shareUrl}\n`);
-            });
-
-            md += '</table>\n\n---\n\n## 📋 Share Links\n\n';
-            jsonTracks.forEach(t => md += `- [${t.artist || artist} — ${t.title}](${t.shareUrl})\n`);
-
-            fs.writeFileSync(`${dir}/README.md`, md);
-            fs.writeFileSync(`${dir}/links.txt`, linksTxt);
-            fs.writeFileSync(`${dir}/links.json`, JSON.stringify({ artist, query, total: finalTracks.length, tracks: jsonTracks, proxyUsed }, null, 2));
-
-            console.log(`✅ Saved ${finalTracks.length} tracks to ${dir}/`);
-            if (proxyUsed) console.log(`   Proxy used: ${proxyUsed}`);
-
           })();
           SCRIPT
           
