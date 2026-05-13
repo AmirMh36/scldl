@@ -1,0 +1,64 @@
+name: 🎧 SoundCloud Downloader (Private Tracks)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'SoundCloud private track URL'
+        required: true
+        type: string
+
+env:
+  OUTPUT_DIR: music-downloads
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: نصب yt-dlp و FFmpeg
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install -U yt-dlp
+
+      - name: بازسازی فایل کوکی
+        run: |
+          echo "${{ secrets.SC_COOKIES }}" > cookies.txt
+          echo "✅ کوکی‌ها بازسازی شد."
+
+      - name: دانلود آهنگ خصوصی
+        env:
+          SC_URL: ${{ github.event.inputs.url }}
+        run: |
+          mkdir -p "$OUTPUT_DIR"
+          echo "🎵 در حال دانلود آهنگ خصوصی..."
+          yt-dlp \
+            --cookies cookies.txt \
+            --extract-audio \
+            --audio-format mp3 \
+            --audio-quality 320k \
+            --embed-metadata \
+            -o "$OUTPUT_DIR/%(uploader)s - %(title)s.%(ext)s" \
+            "$SC_URL"
+
+      - name: نمایش فایل‌ها
+        run: |
+          echo "📁 فایل‌های دانلود شده:"
+          ls -lh "$OUTPUT_DIR"/*.mp3 2>/dev/null || echo "هنوز فایلی وجود ندارد"
+
+      - name: پاک‌سازی فایل‌های موقت
+        run: |
+          find "$OUTPUT_DIR" -type f -name "*.mp3" -size -10240c -delete 2>/dev/null || true
+          rm -f cookies.txt
+
+      - name: Commit و Push
+        if: always()
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add "$OUTPUT_DIR/"
+          git diff --staged --quiet || git commit -m "🎵 $(date +%H:%M)" && git push
