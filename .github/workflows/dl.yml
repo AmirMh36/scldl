@@ -30,25 +30,42 @@ jobs:
           echo "${{ secrets.SC_COOKIES }}" > cookies.txt
           echo "✅ کوکی‌ها بازسازی شد."
 
-      - name: دانلود آهنگ خصوصی
+      - name: دانلود آهنگ (با تست همه فرمت‌ها)
         env:
           SC_URL: ${{ github.event.inputs.url }}
         run: |
           mkdir -p "$OUTPUT_DIR"
-          echo "🎵 در حال دانلود آهنگ خصوصی..."
+          echo "🎵 در حال دانلود (آزمایش progressive و HLS)..."
+          
+          # دستور اول: تلاش برای progressive stream با کیفیت اصلی
           yt-dlp \
             --cookies cookies.txt \
+            -f "progressive" \
             --extract-audio \
             --audio-format mp3 \
             --audio-quality 320k \
             --embed-metadata \
             -o "$OUTPUT_DIR/%(uploader)s - %(title)s.%(ext)s" \
-            "$SC_URL"
+            "$SC_URL" 2>&1 || echo "⚠️ progressive stream ناموفق بود. در حال تلاش با فرمت عمومی‌تر..."
+          
+          # اگر progressive کار نکرد، بهترین فرمت موجود را امتحان کن
+          if [ ! "$(ls -A $OUTPUT_DIR/*.mp3 2>/dev/null)" ]; then
+            echo "🔄 تلاش مجدد با بهترین فرمت در دسترس..."
+            yt-dlp \
+              --cookies cookies.txt \
+              -f "bestaudio/best" \
+              --extract-audio \
+              --audio-format mp3 \
+              --audio-quality 320k \
+              --embed-metadata \
+              -o "$OUTPUT_DIR/%(uploader)s - %(title)s.%(ext)s" \
+              "$SC_URL"
+          fi
 
       - name: نمایش فایل‌ها
         run: |
           echo "📁 فایل‌های دانلود شده:"
-          ls -lh "$OUTPUT_DIR"/*.mp3 2>/dev/null || echo "هنوز فایلی وجود ندارد"
+          ls -lh "$OUTPUT_DIR"/*.mp3 2>/dev/null || echo "❌ هیچ فایلی دانلود نشد."
 
       - name: پاک‌سازی فایل‌های موقت
         run: |
