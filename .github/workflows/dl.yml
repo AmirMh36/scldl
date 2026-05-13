@@ -1,3 +1,4 @@
+# .github/workflows/soundcloud-private-puppeteer.yml
 name: 🎧 SoundCloud Private Downloader (Puppeteer)
 
 on:
@@ -37,8 +38,6 @@ jobs:
           SC_COOKIES: ${{ secrets.SC_COOKIES }}
         run: |
           mkdir -p "$OUTPUT_DIR"
-          
-          # ذخیره کوکی‌ها در فایل
           echo "$SC_COOKIES" > cookies.txt
           
           cat > download.js << 'SCRIPT'
@@ -51,7 +50,7 @@ jobs:
             const url = process.env.SC_URL;
             const cookiesText = fs.readFileSync('cookies.txt', 'utf8');
             
-            // تبدیل فایل کوکی Netscape به آرایه‌ای از کوکی‌ها برای Puppeteer
+            // تبدیل فایل کوکی Netscape به آرایه‌ای از کوکی‌ها
             const cookies = cookiesText
               .split('\n')
               .filter(line => line && !line.startsWith('#'))
@@ -92,48 +91,56 @@ jobs:
             });
             console.log(`🎵 ${metadata.artist} - ${metadata.title}`);
 
-            // رهگیری درخواست‌های شبکه
             let streamUrl = null;
+            
+            // روش ۱: رهگیری شبکه + کلیک ایمن
             await page.setRequestInterception(true);
             page.on('request', req => {
               const url = req.url();
               if (url.includes('.mp3') || url.includes('/media/') || url.includes('/stream/')) {
                 console.log('🎯 لینک استریم پیدا شد:', url.substring(0, 100));
                 streamUrl = url;
-                req.abort(); // برای جلوگیری از دانلود توسط مرورگر
+                req.abort();
               } else {
                 req.continue();
               }
             });
 
-            // کلیک روی دکمه Play
-            const playBtn = await page.$('button.playControl');
-            if (playBtn) {
-              console.log('▶️ کلیک روی Play...');
-              await playBtn.click();
-              // منتظر بمانیم تا درخواست صوتی ارسال شود
-              await page.waitForFunction(() => !!window._foundStream, { timeout: 10000 }).catch(() => {});
-              await new Promise(r => setTimeout(r, 3000));
+            // کلیک با JavaScript خالص
+            const clicked = await page.evaluate(() => {
+              const btn = document.querySelector('button.playControl') ||
+                          document.querySelector('.playControl') ||
+                          document.querySelector('[class*="playControl"]') ||
+                          document.querySelector('button[title="Play"]');
+              if (btn) {
+                btn.click();
+                return true;
+              }
+              return false;
+            });
+            
+            if (clicked) {
+              console.log('✅ دکمه Play کلیک شد، منتظر استریم...');
+              await new Promise(r => setTimeout(r, 5000));
+            } else {
+              console.log('⚠️ دکمه Play پیدا نشد');
             }
 
+            // روش ۲: اگر استریم پیدا نشد، در source جستجو کن
             if (!streamUrl) {
-              // شاید دکمه play نبود، تلاش برای پیدا کردن progressive URL از API (اگر هنوز در صفحه باشد)
-              console.log('🔄 تلاش برای استخراج از API...');
-              streamUrl = await page.evaluate(() => {
-                const scripts = document.querySelectorAll('script');
-                for (const s of scripts) {
-                  const text = s.textContent;
-                  const match = text.match(/"url"\s*:\s*"([^"]+\.mp3[^"]*)"/);
-                  if (match) return match[1];
-                }
-                return null;
-              });
+              console.log('🔄 جستجوی URL در source صفحه...');
+              const pageSource = await page.content();
+              const match = pageSource.match(/"url":"(https:\\\/\\\/[^"]+\.mp3[^"]*)"/);
+              if (match) {
+                streamUrl = match[1].replace(/\\\//g, '/');
+                console.log('🎯 از source پیدا شد');
+              }
             }
 
             await browser.close();
 
             if (!streamUrl) {
-              console.error('❌ نتوانستیم لینک دانلود پیدا کنیم.');
+              console.error('❌ هیچ لینک استریمی پیدا نشد');
               process.exit(1);
             }
 
@@ -156,7 +163,7 @@ jobs:
           
           node download.js
 
-      - name: پاکسازی
+      - name: پاکسازی فایل موقت
         run: rm -f cookies.txt
 
       - name: نمایش فایل‌ها
