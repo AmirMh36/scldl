@@ -22,77 +22,76 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Setup Node.js and FFmpeg
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install dependencies
+      - name: Install orpheusdl and soundcloud plugin
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
-          npm install -g multidl-cli
-          echo "✅ Ready"
+          sudo apt-get install -y -qq ffmpeg python3-pip
+          
+          pip3 install orpheusdl
+          pip3 install orpheusdl-soundcloud
+          
+          echo "✅ orpheusdl installed"
+
+      - name: Configure orpheusdl
+        run: |
+          mkdir -p ~/.config/orpheusdl
+          cat > ~/.config/orpheusdl/config.json << EOF
+          {
+            "soundcloud": {
+              "client_id": "a3e059563d7fd3372b49b37f00a00bcf",
+              "app_version": "1621419210"
+            }
+          }
+          EOF
+          echo "✅ Configured"
 
       - name: Download from SoundCloud
         env:
           SC_URL: ${{ github.event.inputs.url }}
-          SC_OAUTH_TOKEN: ${{ secrets.SC_AUTH_TOKEN }}
         run: |
           mkdir -p music-downloads
           cd music-downloads
           
-          echo "🎵 Downloading from SoundCloud..."
+          echo "🎵 Downloading with orpheusdl..."
           echo "URL: $SC_URL"
           echo ""
           
-          # Pass token via stdin
-          echo "$SC_OAUTH_TOKEN" | multidl \
-            "$SC_URL" \
-            --download-dir . \
-            --quality high 2>&1
+          orpheusdl "$SC_URL" 2>&1
           
           echo ""
           echo "📁 Downloaded files:"
-          ls -lh
+          ls -lhR
 
-      - name: Convert M4A to MP3
+      - name: Convert to MP3 if needed
         run: |
           cd music-downloads
           
-          for f in *.m4a; do
-            if [ -f "$f" ]; then
-              BASENAME="${f%.m4a}"
-              echo "🔄 Converting: $f → ${BASENAME}.mp3"
-              
-              ffmpeg -i "$f" \
-                -c:a libmp3lame \
-                -b:a 320k \
-                -ar 44100 \
-                -y \
-                "${BASENAME}.mp3" 2>&1 | tail -1
-              
-              if [ -f "${BASENAME}.mp3" ] && [ $(stat -c%s "${BASENAME}.mp3") -gt 10000 ]; then
-                echo "✅ Created: ${BASENAME}.mp3"
-                rm "$f"  # Remove M4A
-              else
-                echo "⚠️ Conversion failed, keeping M4A"
-              fi
+          # Find audio files and convert
+          find . -type f \( -name "*.flac" -o -name "*.m4a" -o -name "*.ogg" -o -name "*.opus" \) | while read f; do
+            SIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            if [ "$SIZE" -gt 10240 ]; then
+              NAME="${f%.*}"
+              echo "🔄 Converting: $f"
+              ffmpeg -nostdin -i "$f" -c:a libmp3lame -b:a 320k -ar 44100 -y "${NAME}.mp3" 2>/dev/null && rm "$f"
             fi
           done
           
           echo ""
-          echo "📁 Final files:"
-          ls -lh *.mp3 2>/dev/null || echo "No MP3 files"
+          echo "📁 Final MP3 files:"
+          find . -name "*.mp3" -type f | while read f; do
+            echo "  ✅ $f ($(du -h "$f" | cut -f1))"
+          done
 
       - name: Commit and push
+        if: always()
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git remote set-url origin https://x-access-token:${{ secrets.GH_PAT || github.token }}@github.com/${{ github.repository }}.git
-          
-          # Remove non-MP3 files
+          # Clean up
           find music-downloads -type f ! -name "*.mp3" -delete 2>/dev/null || true
+          find music-downloads -type f -name "*.mp3" -size -10240c -delete 2>/dev/null || true
+          
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git remote set-url origin https://x-access-token:${{ secrets.GH_PAT || github.token }}@github.com/${{ github.repository }}.git
           
           git add music-downloads/
           
@@ -101,5 +100,5 @@ jobs:
           else
             git commit -m "🎵 $(date +%Y-%m-%d_%H-%M-%S)"
             git push
-            echo "✅ MP3 committed to repository!"
+            echo "✅ Done!"
           fi
