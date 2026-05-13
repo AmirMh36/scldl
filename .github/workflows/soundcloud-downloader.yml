@@ -57,7 +57,7 @@ jobs:
           cat > sc-downloader/download.js << 'SCRIPT_EOF'
           const fs = require('fs');
           const path = require('path');
-          const { execSync } = require('child_process');
+          const { spawnSync } = require('child_process');
           const scdl = require('@snwfdhmp/soundcloud-downloader').default;
 
           const URL = process.env.SC_URL;
@@ -77,7 +77,7 @@ jobs:
           async function downloadTrack(trackUrl) {
             const info = await scdl.getInfo(trackUrl);
             const baseName = cleanName(`${info.user?.username || 'unknown'} - ${info.title || 'unknown'}`);
-            const rawFile = path.join(OUTPUT_DIR, `${baseName}.raw`);
+            const rawFile = path.join(OUTPUT_DIR, `${baseName}.m4a`);
             const finalFile = path.join(OUTPUT_DIR, `${baseName}.mp3`);
 
             console.log(`  ⬇ ${info.user?.username} - ${info.title}`);
@@ -94,46 +94,42 @@ jobs:
             });
 
             const rawSize = (fs.statSync(rawFile).size / 1024 / 1024).toFixed(1);
-            console.log(`  📥 Raw file: ${rawSize} MB`);
+            console.log(`  📥 Downloaded M4A: ${rawSize} MB`);
 
-            // Check file signature to detect real format
-            const buffer = Buffer.alloc(8);
-            const fd = fs.openSync(rawFile, 'r');
-            fs.readSync(fd, buffer, 0, 8, 0);
-            fs.closeSync(fd);
-            
-            const hex = buffer.toString('hex').substring(0, 16);
-            console.log(`  🔍 File signature: ${hex}`);
-
-            // Convert to MP3
+            // Convert M4A to MP3 using spawn (no buffer issue)
             console.log('  🔄 Converting to MP3...');
-            try {
-              execSync(
-                `ffmpeg -i "${rawFile}" -codec:a libmp3lame -b:a 320k -ar 44100 -y "${finalFile}"`,
-                { stdio: 'pipe', timeout: 120000 }
-              );
-              
+            
+            const result = spawnSync('ffmpeg', [
+              '-i', rawFile,
+              '-codec:a', 'libmp3lame',
+              '-b:a', '320k',
+              '-ar', '44100',
+              '-map_metadata', '0',
+              '-y',
+              finalFile
+            ], {
+              stdio: 'inherit',  // مستقیم به stdout/stderr هدایت کن نه pipe
+              timeout: 120000
+            });
+
+            if (result.error) {
+              console.error(`  ❌ FFmpeg error: ${result.error.message}`);
+              // Keep M4A as fallback
+              console.log(`  ⚠️ Saved M4A instead: ${baseName}.m4a`);
+              return { fileName: `${baseName}.m4a`, filePath: rawFile };
+            }
+
+            if (result.status === 0) {
               const finalSize = (fs.statSync(finalFile).size / 1024 / 1024).toFixed(1);
               console.log(`  ✅ MP3: ${baseName}.mp3 (${finalSize} MB)`);
               
-              // Clean up raw file
+              // Delete raw M4A
               fs.unlinkSync(rawFile);
               
               return { fileName: `${baseName}.mp3`, filePath: finalFile };
-            } catch (err) {
-              console.error('  ❌ FFmpeg conversion failed:', err.message);
-              
-              // Try to identify extension and save with correct format
-              const ext = hex.startsWith('4f676753') ? '.ogg' :
-                         hex.startsWith('fff1') || hex.startsWith('fff3') || hex.startsWith('fff9') ? '.aac' :
-                         hex.startsWith('494433') || hex.startsWith('fffb') ? '.mp3' :
-                         hex.startsWith('000001b') ? '.m4a' :
-                         '.audio';
-              
-              const fallbackFile = path.join(OUTPUT_DIR, `${baseName}${ext}`);
-              fs.renameSync(rawFile, fallbackFile);
-              console.log(`  ⚠️ Saved as: ${baseName}${ext}`);
-              return { fileName: `${baseName}${ext}`, filePath: fallbackFile };
+            } else {
+              console.log(`  ⚠️ FFmpeg failed, keeping M4A: ${baseName}.m4a`);
+              return { fileName: `${baseName}.m4a`, filePath: rawFile };
             }
           }
 
@@ -187,18 +183,13 @@ jobs:
         env:
           SC_URL: ${{ github.event.inputs.url }}
           SC_TYPE: ${{ github.event.inputs.type }}
-        run: |
-          echo "Starting download..."
-          node download.js
-          echo ""
-          echo "Output files:"
-          ls -lh downloads/ || echo "No downloads directory"
+        run: node download.js
 
       - name: Copy files to repo
         run: |
           mkdir -p music-downloads
           cp sc-downloader/downloads/*.mp3 music-downloads/ 2>/dev/null || true
-          cp sc-downloader/downloads/*.ogg music-downloads/ 2>/dev/null || true
+          cp sc-downloader/downloads/*.m4a music-downloads/ 2>/dev/null || true
           cp sc-downloader/downloads/*.json music-downloads/ 2>/dev/null || true
           echo "Files ready to commit:"
           ls -lh music-downloads/
