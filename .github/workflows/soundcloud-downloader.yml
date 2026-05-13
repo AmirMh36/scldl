@@ -1,128 +1,109 @@
-# .github/workflows/soundcloud-downloader.yml
-name: SoundCloud Downloader
+name: 🎵 SoundCloud Downloader
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'SoundCloud track or playlist URL'
+        description: 'SoundCloud share URL (e.g., https://soundcloud.com/...?si=...)'
         required: true
         type: string
+      oauth_token:
+        description: 'OAuth token (برای آهنگ‌های خصوصی)'
+        required: false
+        type: string
+
+env:
+  OUTPUT_DIR: music-downloads
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     permissions:
       contents: write
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
         with:
-          token: ${{ secrets.GH_PAT || github.token }}
+          node-version: '24'
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install FFmpeg
+      - name: نصب ابزارها
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
-          echo "✅ FFmpeg ready"
-
-      - name: Install btch-downloader
-        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg curl
+          npm init -y
           npm install btch-downloader
-          echo "✅ btch-downloader installed"
 
-      - name: Download from SoundCloud
+      - name: دریافت لینک دانلود و بارگیری
         env:
           SC_URL: ${{ github.event.inputs.url }}
+          SC_AUTH_TOKEN: ${{ github.event.inputs.oauth_token }}
         run: |
-          mkdir -p music-downloads
+          mkdir -p $OUTPUT_DIR
           
           cat > download.js << 'SCRIPT'
           const { soundcloud } = require('btch-downloader');
-          const fs = require('fs');
           const { execSync } = require('child_process');
+          const fs = require('fs');
 
           const url = process.env.SC_URL;
+          const token = process.env.SC_AUTH_TOKEN || '';
 
-          console.log('🎵 SoundCloud Downloader');
-          console.log('URL:', url);
-          console.log('');
-
+          console.log('🔗 دریافت اطلاعات آهنگ...');
           soundcloud(url)
             .then(data => {
-              // Extract download URL from correct path
-              const downloadUrl = data?.result?.downloadMp3 || 
-                                 data?.result?.audio || 
-                                 data?.downloadMp3 || 
-                                 data?.audio || '';
-
+              // استخراج لینک مستقیم MP3
+              const downloadUrl = data?.result?.downloadMp3 || data?.result?.audio || '';
               if (!downloadUrl || !downloadUrl.startsWith('http')) {
-                console.error('❌ No download URL found');
-                console.log('Response:', JSON.stringify(data, null, 2));
+                console.error('❌ لینک دانلود پیدا نشد. ممکن است آهنگ خصوصی باشد.');
+                if (data?.result?.title) console.log('عنوان:', data.result.title);
                 process.exit(1);
               }
 
-              const title = (data?.result?.title || 'soundcloud-track')
+              const title = (data.result.title || 'soundcloud_track')
                 .replace(/[<>:"/\\|?*]/g, '')
-                .substring(0, 100);
+                .substring(0, 80);
+              
+              const outputFile = `${process.env.OUTPUT_DIR}/${title}.mp3`;
 
-              console.log('📝 Title:', title);
-              console.log('🔗 Found download URL');
-              console.log('⬇ Downloading...');
+              console.log(`⬇️ در حال دانلود: ${title}`);
+              // curl مستقیم فایل MP3
+              execSync(`curl -L --retry 3 -o "${outputFile}" "${downloadUrl}"`, { stdio: 'inherit' });
 
-              const output = `music-downloads/${title}.mp3`;
-
-              execSync(
-                `ffmpeg -i "${downloadUrl}" -c:a libmp3lame -b:a 320k -ar 44100 -y "${output}"`,
-                { stdio: 'inherit', timeout: 120000 }
-              );
-
-              if (fs.existsSync(output)) {
-                const size = (fs.statSync(output).size / 1024 / 1024).toFixed(1);
-                console.log(`\n✅ Done! ${title}.mp3 (${size} MB)`);
+              if (fs.existsSync(outputFile)) {
+                const sizeMB = (fs.statSync(outputFile).size / 1_048_576).toFixed(1);
+                if (parseFloat(sizeMB) < 0.01) {
+                  console.error('❌ فایل دانلود شده خالی است.');
+                  process.exit(1);
+                }
+                console.log(`✅ دانلود کامل: ${title}.mp3 (${sizeMB} MB)`);
               } else {
-                console.error('❌ File not created');
+                console.error('❌ فایل ایجاد نشد.');
                 process.exit(1);
               }
             })
             .catch(err => {
-              console.error('❌ Error:', err.message);
+              console.error('❌ خطا:', err.message);
               process.exit(1);
             });
           SCRIPT
-
+          
           node download.js
 
-      - name: Show result
+      - name: نمایش فایل نهایی
         run: |
           echo ""
-          echo "📁 Downloaded files:"
-          ls -lh music-downloads/*.mp3 2>/dev/null || echo "No MP3 files"
+          echo "📁 فایل‌های دانلود شده:"
+          ls -lh $OUTPUT_DIR/*.mp3 2>/dev/null || echo "هنوز فایلی وجود ندارد"
 
-      - name: Commit and push
+      - name: commit و push
         if: always()
         run: |
-          # Clean up non-MP3 files
-          find music-downloads -type f ! -name "*.mp3" -delete 2>/dev/null || true
-          find music-downloads -type f -name "*.mp3" -size -10240c -delete 2>/dev/null || true
+          # حذف فایل‌های خراب (کمتر از ۱۰ کیلوبایت)
+          find $OUTPUT_DIR -name "*.mp3" -size -10240c -delete 2>/dev/null || true
           
-          git config --local user.email "actions@github.com"
-          git config --local user.name "GitHub Actions"
-          git remote set-url origin https://x-access-token:${{ secrets.GH_PAT || github.token }}@github.com/${{ github.repository }}.git
-          
-          git add music-downloads/
-          
-          if git diff --staged --quiet; then
-            echo "Nothing to commit"
-          else
-            git commit -m "🎵 $(date +%Y-%m-%d_%H-%M-%S)"
-            git push
-            echo "✅ Committed to repository!"
-          fi
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add $OUTPUT_DIR/
+          git diff --staged --quiet || git commit -m "🎵 $(date +%H:%M)" && git push
