@@ -1,7 +1,29 @@
 {
   "query": "earth to eve",
-  "artist": "earth to eve",
-  "song": "",
-  "total_results": 0,
-  "error": "No results or rate limited"
+  "date": "2026-05-13T09:57:38.055774",
+  "total": 1,
+  "links_by_artist": {
+    "Earth To Eve": [
+      {
+        "index": 1,
+        "artist": "Earth To Eve",
+        "title": "THREAT LEVEL ORANGE",
+        "url": "https://soundcloud.com/earthtoeve/threat-level-orange-1",
+        "duration_seconds": 153,
+        "plays": 9589,
+        "description": ""
+      }
+    ]
+  },
+  "all_links": [
+    {
+      "index": 1,
+      "artist": "Earth To Eve",
+      "title": "THREAT LEVEL ORANGE",
+      "url": "https://soundcloud.com/earthtoeve/threat-level-orange-1",
+      "duration_seconds": 153,
+      "plays": 9589,
+      "description": ""
+    }
+  ]
 }
