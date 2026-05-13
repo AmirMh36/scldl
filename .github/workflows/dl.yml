@@ -1,28 +1,48 @@
-name: دانلود از ساندکلاد با soundcloud-dl-v2
+name: 🎧 SoundCloud Private (dl-soundcloud)
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'آدرس URL موزیک ساندکلاد'
+        description: 'آدرس آهنگ خصوصی'
         required: true
         type: string
 
 jobs:
   download:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
-      - uses: actions/checkout@v4
-      - name: نصب Rust
+      - uses: actions/checkout@v5
+
+      - name: نصب ابزارها
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          source $HOME/.cargo/env
-      - name: نصب soundcloud-dl-v2
-        run: cargo install soundcloud-dl-v2  # اطمینان حاصل کنید که crate در crates.io وجود دارد
-      - name: دانلود موزیک
-        run: scdl --url "${{ github.event.inputs.url }}" --use-default-metadata
-      - name: ذخیره فایل MP3
-        uses: actions/upload-artifact@v4
-        with:
-          name: soundcloud-track
-          path: ./*.mp3
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip3 install dl-soundcloud
+
+      - name: استخراج توکن و دانلود
+        env:
+          SC_COOKIES: ${{ secrets.SC_COOKIES }}
+        run: |
+          echo "$SC_COOKIES" > cookies.txt
+          OAUTH_TOKEN=$(grep 'oauth_token' cookies.txt | awk '{print $NF}')
+          
+          mkdir -p music-downloads
+          cd music-downloads
+          
+          # استفاده از توکن برای دانلود
+          scl "${{ github.event.inputs.url }}" --auth-token "$OAUTH_TOKEN"
+          
+          # تبدیل به MP3 در صورت نیاز
+          for f in *.m4a *.ogg *.opus; do
+            [ -f "$f" ] && ffmpeg -i "$f" -c:a libmp3lame -b:a 320k "${f%.*}.mp3" && rm "$f"
+          done
+
+      - name: Commit
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add music-downloads/
+          git diff --staged --quiet || git commit -m "🎵 $(date +%H:%M)" && git push
