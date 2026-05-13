@@ -22,15 +22,17 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Setup Node.js
+      - name: Setup Node.js and FFmpeg
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install multidl-cli
+      - name: Install dependencies
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
           npm install -g multidl-cli
-          echo "✅ multidl-cli $(multidl --version 2>/dev/null || echo 'installed')"
+          echo "✅ Ready"
 
       - name: Download from SoundCloud
         env:
@@ -44,15 +46,44 @@ jobs:
           echo "URL: $SC_URL"
           echo ""
           
-          multidl \
+          # Pass token via stdin
+          echo "$SC_OAUTH_TOKEN" | multidl \
             "$SC_URL" \
             --download-dir . \
-            --oauth-token "$SC_OAUTH_TOKEN" \
             --quality high 2>&1
           
           echo ""
           echo "📁 Downloaded files:"
-          ls -lh *.{mp3,m4a,flac,wav} 2>/dev/null || ls -lh
+          ls -lh
+
+      - name: Convert M4A to MP3
+        run: |
+          cd music-downloads
+          
+          for f in *.m4a; do
+            if [ -f "$f" ]; then
+              BASENAME="${f%.m4a}"
+              echo "🔄 Converting: $f → ${BASENAME}.mp3"
+              
+              ffmpeg -i "$f" \
+                -c:a libmp3lame \
+                -b:a 320k \
+                -ar 44100 \
+                -y \
+                "${BASENAME}.mp3" 2>&1 | tail -1
+              
+              if [ -f "${BASENAME}.mp3" ] && [ $(stat -c%s "${BASENAME}.mp3") -gt 10000 ]; then
+                echo "✅ Created: ${BASENAME}.mp3"
+                rm "$f"  # Remove M4A
+              else
+                echo "⚠️ Conversion failed, keeping M4A"
+              fi
+            fi
+          done
+          
+          echo ""
+          echo "📁 Final files:"
+          ls -lh *.mp3 2>/dev/null || echo "No MP3 files"
 
       - name: Commit and push
         run: |
@@ -60,12 +91,15 @@ jobs:
           git config --local user.name "github-actions[bot]"
           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT || github.token }}@github.com/${{ github.repository }}.git
           
+          # Remove non-MP3 files
+          find music-downloads -type f ! -name "*.mp3" -delete 2>/dev/null || true
+          
           git add music-downloads/
           
           if git diff --staged --quiet; then
-            echo "No changes to commit"
+            echo "Nothing to commit"
           else
             git commit -m "🎵 $(date +%Y-%m-%d_%H-%M-%S)"
             git push
-            echo "✅ Done!"
+            echo "✅ MP3 committed to repository!"
           fi
