@@ -27,17 +27,16 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+      - name: Setup Python & yt-dlp
+        run: |
+          sudo apt-get update -qq
+          pip3 install yt-dlp
+          echo "✅ Ready"
 
-      - name: Search and extract links
+      - name: Search SoundCloud
         env:
           ARTIST: ${{ github.event.inputs.artist }}
           SONG: ${{ github.event.inputs.song }}
@@ -45,189 +44,106 @@ jobs:
         run: |
           mkdir -p search-results
           
-          cat > search.js << 'SCRIPT'
-          const fs = require('fs');
-          const https = require('https');
-
-          const artist = process.env.ARTIST.trim();
-          const song = process.env.SONG.trim();
-          const limit = parseInt(process.env.LIMIT) || 10;
-
-          let query = artist;
-          if (song) query = `${artist} ${song}`;
-
-          function fetchUrl(url, headers = {}) {
-            return new Promise((resolve, reject) => {
-              https.get(url, { 
-                headers: { 
-                  'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                  'Accept': 'text/html,application/json',
-                  ...headers
-                } 
-              }, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => resolve({ status: res.statusCode, data }));
-              }).on('error', reject);
-            });
-          }
-
-          function extractClientId(html) {
-            // Method 1: Look for client_id in script tags
-            const match1 = html.match(/client_id\s*:\s*"([^"]+)"/);
-            if (match1) return match1[1];
-            
-            // Method 2: Look in JS files references
-            const match2 = html.match(/client_id=([a-zA-Z0-9]+)/);
-            if (match2) return match2[1];
-            
-            return null;
-          }
-
-          async function getNewClientId() {
-            console.log('🔑 Getting fresh Client ID...');
-            
-            // Get SoundCloud homepage
-            const { data: html } = await fetchUrl('https://soundcloud.com/');
-            let clientId = extractClientId(html);
-            
-            if (clientId) {
-              console.log(`  ✅ Found: ${clientId}`);
-              return clientId;
-            }
-            
-            // Try discover page
-            console.log('  Trying discover page...');
-            const { data: html2 } = await fetchUrl('https://soundcloud.com/discover');
-            clientId = extractClientId(html2);
-            
-            if (clientId) {
-              console.log(`  ✅ Found: ${clientId}`);
-              return clientId;
-            }
-            
-            // Fallback to known working IDs
-            const fallbacks = [
-              'a3e059563d7fd3372b49b37f00a00bcf',
-              '2t9loNQH90kzJcsFCODdigxfp325aq4z',
-              'YmLFvCHknImXSwYdVkLvLJZbXjwbWjwd',
-              'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX'
-            ];
-            
-            console.log('  Using fallback IDs...');
-            return fallbacks;
-          }
-
-          async function search(clientId) {
-            const encodedQuery = encodeURIComponent(query);
-            const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodedQuery}&client_id=${clientId}&limit=${limit}`;
-            
-            console.log(`  Trying: ${searchUrl.substring(0, 100)}...`);
-            
-            const { status, data } = await fetchUrl(searchUrl);
-            console.log(`  Status: ${status}`);
-            
-            if (status === 200 && data) {
-              try {
-                return JSON.parse(data);
-              } catch(e) {
-                console.log(`  Parse error: ${e.message}`);
-              }
-            }
-            
-            return null;
-          }
-
-          async function main() {
-            console.log('🔍 SoundCloud Search');
-            console.log(`Query: "${query}"`);
-            console.log('');
-
-            // Get client ID
-            const clientIds = await getNewClientId();
-            const ids = Array.isArray(clientIds) ? clientIds : [clientIds];
-            
-            let result = null;
-            
-            for (const id of ids) {
-              if (result) break;
-              result = await search(id);
-            }
-            
-            if (!result || !result.collection || result.collection.length === 0) {
-              console.log('\n❌ No results found');
-              fs.writeFileSync('search-results/links.json', JSON.stringify({
-                query, artist, song, total_results: 0, error: 'No results or rate limited'
-              }, null, 2));
-              process.exit(0);
-            }
-
-            const tracks = result.collection;
-            console.log(`\n✅ Found ${tracks.length} tracks!\n`);
-
-            const linksByArtist = {};
-            const allLinks = [];
-
-            tracks.forEach((track, i) => {
-              const trackArtist = track.user?.username || 'Unknown';
-              const title = track.title || 'Unknown';
-              const url = track.permalink_url || '';
-
-              const trackInfo = {
-                index: i + 1,
-                artist: trackArtist,
-                title: title,
-                url: url,
-                duration_seconds: Math.floor((track.duration || 0) / 1000),
-                plays: track.playback_count || 0,
-                genre: track.genre || 'Unknown',
-              };
-
-              allLinks.push(trackInfo);
-
-              if (!linksByArtist[trackArtist]) {
-                linksByArtist[trackArtist] = [];
-              }
-              linksByArtist[trackArtist].push(trackInfo);
-
-              const mins = Math.floor(trackInfo.duration_seconds / 60);
-              const secs = trackInfo.duration_seconds % 60;
-              console.log(`${i + 1}. ${trackArtist} - ${title}`);
-              console.log(`   ⏱ ${mins}:${secs.toString().padStart(2, '0')} | 🔗 ${url}\n`);
-            });
-
-            // Save files
-            fs.writeFileSync('search-results/links.json', JSON.stringify({
-              query, artist, song: song || 'all',
-              date: new Date().toISOString(),
-              total_results: tracks.length,
-              links_by_artist: linksByArtist,
-              all_links: allLinks
-            }, null, 2));
-
-            // URLs only
-            let urlList = `# SoundCloud Links: "${query}"\n`;
-            urlList += `# Date: ${new Date().toISOString()}\n\n`;
-            for (const [a, t] of Object.entries(linksByArtist)) {
-              urlList += `## ${a}\n`;
-              t.forEach(tr => { urlList += `${tr.url}\n`; });
-              urlList += '\n';
-            }
-            fs.writeFileSync('search-results/links.txt', urlList);
-
-            console.log('✅ Done! Files saved to search-results/');
-          }
-
-          main().catch(err => {
-            console.error('Fatal:', err.message);
-            fs.writeFileSync('search-results/error.txt', err.message);
-          });
-          SCRIPT
+          QUERY="$ARTIST $SONG"
           
-          node search.js
+          echo "🔍 Searching: $QUERY"
+          echo ""
+          
+          # yt-dlp flat search (no download, just metadata)
+          yt-dlp \
+            --flat-playlist \
+            --dump-json \
+            --no-download \
+            --no-check-certificate \
+            --default-search "scsearch" \
+            --max-downloads "$LIMIT" \
+            "$QUERY" > search-results/raw.json 2>&1
+          
+          # Parse results
+          python3 << 'PYEOF'
+          import json, os
 
-      - name: Show results
-        if: always()
+          input_file = 'search-results/raw.json'
+          if not os.path.exists(input_file):
+              print("No results file")
+              exit()
+
+          with open(input_file) as f:
+              content = f.read()
+
+          tracks = []
+          for line in content.split('\n'):
+              if line.startswith('{'):
+                  try:
+                      track = json.loads(line)
+                      tracks.append(track)
+                  except:
+                      pass
+
+          if not tracks:
+              print("❌ No tracks found")
+              with open('search-results/links.txt', 'w') as f:
+                  f.write('No results found')
+              exit()
+
+          print(f"✅ Found {len(tracks)} tracks:\n")
+
+          links = {}
+          all_links = []
+
+          for i, t in enumerate(tracks):
+              artist = t.get('uploader', t.get('artist', 'Unknown'))
+              title = t.get('title', 'Unknown')
+              url = t.get('webpage_url', t.get('url', ''))
+              duration = t.get('duration', 0) or 0
+              
+              track_info = {
+                  'index': i + 1,
+                  'artist': artist,
+                  'title': title,
+                  'url': url,
+                  'duration_seconds': int(duration),
+                  'plays': t.get('view_count', 0) or 0,
+                  'description': (t.get('description', '') or '')[:200]
+              }
+              
+              all_links.append(track_info)
+              
+              if artist not in links:
+                  links[artist] = []
+              links[artist].append(track_info)
+              
+              mins = int(duration // 60)
+              secs = int(duration % 60)
+              print(f"{i+1}. {artist} - {title}")
+              print(f"   ⏱ {mins}:{secs:02d} | 🔗 {url}\n")
+
+          # Save JSON
+          output = {
+              'query': f"{os.environ.get('ARTIST', '')} {os.environ.get('SONG', '')}".strip(),
+              'date': __import__('datetime').datetime.now().isoformat(),
+              'total': len(tracks),
+              'links_by_artist': links,
+              'all_links': all_links
+          }
+          
+          with open('search-results/links.json', 'w') as f:
+              json.dump(output, f, indent=2)
+
+          # Save URLs only
+          with open('search-results/links.txt', 'w') as f:
+              f.write(f"# SoundCloud Search: {output['query']}\n")
+              f.write(f"# Date: {output['date']}\n\n")
+              for artist_name, tracks_list in links.items():
+                  f.write(f"## {artist_name}\n")
+                  for t in tracks_list:
+                      f.write(f"{t['url']}\n")
+                  f.write('\n')
+
+          print("✅ Saved to search-results/")
+          PYEOF
+
+      - name: Show links
         run: |
           if [ -f search-results/links.txt ]; then
             cat search-results/links.txt
@@ -236,8 +152,10 @@ jobs:
       - name: Commit
         if: always()
         run: |
-          git config --local user.email "actions@github.com"
-          git config --local user.name "GitHub Actions"
-          git remote set-url origin https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           git add search-results/
-          git diff --staged --quiet || git commit -m "🔍 ${{ github.event.inputs.artist }}" && git push
+          git diff --staged --quiet || git commit -m "🔍 $ARTIST" && git push
+        env:
+          ARTIST: ${{ github.event.inputs.artist }}
