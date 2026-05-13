@@ -8,18 +8,9 @@ on:
         description: 'SoundCloud track or playlist URL'
         required: true
         type: string
-      type:
-        description: 'Type (track or playlist)'
-        required: true
-        type: choice
-        options:
-          - track
-          - playlist
-        default: 'track'
 
 env:
-  OUTPUT_DIR: downloads
-  NODE_VERSION: '20'
+  OUTPUT_DIR: music-downloads
 
 jobs:
   download:
@@ -34,187 +25,58 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Install FFmpeg
+      - name: Setup Python and scdl
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg mediainfo
-          ffmpeg -version | head -1
-          echo "✅ FFmpeg installed"
+          sudo apt-get install -y -qq python3 python3-pip ffmpeg
+          pip3 install scdl
+          echo "✅ scdl installed"
 
-      - name: Create project and install dependency
+      - name: Create scdl config
         run: |
-          mkdir -p sc-downloader
-          cd sc-downloader
-          npm init -y
-          npm install @snwfdhmp/soundcloud-downloader
+          mkdir -p ~/.config/scdl
+          cat > ~/.config/scdl/scdl.cfg << 'EOF'
+          [scdl]
+          auth_token = ${{ secrets.SC_AUTH_TOKEN }}
+          path = ./music-downloads
+          name_format = {user[username]} - {title}
+          only_mp3 = true
+          no_original = true
+          continue = true
+          EOF
+          echo "✅ Config created"
 
-      - name: Create download script
-        run: |
-          cat > sc-downloader/download.js << 'SCRIPT_EOF'
-          const fs = require('fs');
-          const path = require('path');
-          const { execSync, spawnSync } = require('child_process');
-          const scdl = require('@snwfdhmp/soundcloud-downloader').default;
-
-          const URL = process.env.SC_URL;
-          const TYPE = process.env.SC_TYPE;
-          const OUTPUT_DIR = process.env.OUTPUT_DIR || 'downloads';
-
-          if (!fs.existsSync(OUTPUT_DIR)) {
-            fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-          }
-
-          function cleanName(str) {
-            return str.replace(/[<>:"/\\|?*]/g, '').substring(0, 100) || 'unknown';
-          }
-
-          async function downloadTrack(trackUrl) {
-            const info = await scdl.getInfo(trackUrl);
-            const baseName = cleanName(`${info.user?.username || 'unknown'} - ${info.title || 'unknown'}`);
-            const tempFile = path.join(OUTPUT_DIR, `_temp_download`);
-            const m4aFile = path.join(OUTPUT_DIR, `${baseName}.m4a`);
-            const mp3File = path.join(OUTPUT_DIR, `${baseName}.mp3`);
-
-            console.log(`\n  ⬇ ${info.user?.username} - ${info.title}`);
-            console.log(`     Duration: ${Math.floor(info.duration/1000)}s`);
-
-            // Step 1: Download
-            const stream = await scdl.download(trackUrl);
-            const writeStream = fs.createWriteStream(tempFile);
-            stream.pipe(writeStream);
-            await new Promise((resolve, reject) => {
-              writeStream.on('finish', resolve);
-              writeStream.on('error', reject);
-              stream.on('error', reject);
-            });
-            
-            let rawSize = (fs.statSync(tempFile).size / 1024 / 1024).toFixed(2);
-            console.log(`     Raw size: ${rawSize} MB`);
-
-            // Step 2: Check what we got
-            console.log('\n  🔍 Checking file type...');
-            try {
-              const mediainfo = execSync(`mediainfo --Output=JSON "${tempFile}" 2>/dev/null || file "${tempFile}"`, {encoding: 'utf8', timeout: 10000});
-              console.log(`     ${mediainfo.substring(0, 300)}`);
-            } catch {
-              const fileOutput = execSync(`file "${tempFile}"`, {encoding: 'utf8'});
-              console.log(`     ${fileOutput.trim()}`);
-            }
-
-            // Step 3: Rename to .m4a (SoundCloud usually serves M4A)
-            fs.renameSync(tempFile, m4aFile);
-            console.log('\n  📦 Saved as M4A');
-
-            // Step 4: Try converting to MP3
-            console.log('\n  🔄 Converting to MP3...');
-            const ffmpegResult = spawnSync('ffmpeg', [
-              '-i', m4aFile,
-              '-c:a', 'libmp3lame',
-              '-b:a', '320k',
-              '-ar', '44100',
-              '-ac', '2',
-              '-y',
-              mp3File
-            ], {
-              stdio: 'inherit',
-              timeout: 120000
-            });
-
-            if (ffmpegResult.status === 0 && fs.existsSync(mp3File) && fs.statSync(mp3File).size > 0) {
-              const mp3Size = (fs.statSync(mp3File).size / 1024 / 1024).toFixed(2);
-              console.log(`  ✅ MP3 created: ${mp3Size} MB`);
-              
-              // Verify MP3
-              const mp3Check = execSync(`file "${mp3File}"`, {encoding: 'utf8'});
-              console.log(`     ${mp3Check.trim()}`);
-              
-              // Remove M4A
-              fs.unlinkSync(m44File);
-              return { fileName: `${baseName}.mp3`, filePath: mp3File };
-            } else {
-              console.log('  ⚠️ MP3 conversion failed, keeping M4A');
-              const m4aSize = (fs.statSync(m4aFile).size / 1024 / 1024).toFixed(2);
-              console.log(`     M4A size: ${m4aSize} MB`);
-              return { fileName: `${baseName}.m4a`, filePath: m4aFile };
-            }
-          }
-
-          async function main() {
-            console.log('🎵 SoundCloud Downloader');
-            console.log('═'.repeat(50));
-
-            const results = [];
-
-            if (TYPE === 'track') {
-              const result = await downloadTrack(URL);
-              results.push(result);
-            } else {
-              const playlist = await scdl.getSetInfo(URL);
-              console.log(`\n📋 ${playlist.title} (${playlist.tracks.length} tracks)`);
-              
-              for (let i = 0; i < playlist.tracks.length; i++) {
-                console.log(`\n[${i + 1}/${playlist.tracks.length}]`);
-                try {
-                  const result = await downloadTrack(playlist.tracks[i].permalink_url);
-                  results.push(result);
-                } catch (err) {
-                  console.error(`  ⚠️ Skipped: ${err.message}`);
-                }
-              }
-            }
-
-            console.log('\n' + '═'.repeat(50));
-            console.log(`✅ ${results.length} file(s) downloaded`);
-            console.log('═'.repeat(50));
-          }
-
-          main().catch(err => {
-            console.error('❌ Fatal error:', err.message);
-            process.exit(1);
-          });
-          SCRIPT_EOF
-
-      - name: Run downloader
-        working-directory: sc-downloader
+      - name: Download from SoundCloud
         env:
           SC_URL: ${{ github.event.inputs.url }}
-          SC_TYPE: ${{ github.event.inputs.type }}
-        run: node download.js
-
-      - name: Check output files
         run: |
+          mkdir -p $OUTPUT_DIR
+          
+          echo "🎵 Downloading from SoundCloud..."
+          echo "URL: $SC_URL"
+          
+          cd $OUTPUT_DIR
+          
+          scdl -l "$SC_URL" --onlymp3
+          
           echo ""
-          echo "📁 Output directory:"
-          ls -lh sc-downloader/downloads/
+          echo "✅ Download complete!"
           echo ""
-          echo "🔍 File type verification:"
-          for f in sc-downloader/downloads/*.{mp3,m4a}; do
-            [ -f "$f" ] && file "$f"
-          done
-
-      - name: Copy to music-downloads
-        run: |
-          mkdir -p music-downloads
-          cp sc-downloader/downloads/*.mp3 music-downloads/ 2>/dev/null || true
-          cp sc-downloader/downloads/*.m4a music-downloads/ 2>/dev/null || true
-          echo "Files for commit:"
-          ls -lh music-downloads/
+          echo "📁 Files:"
+          ls -lh *.mp3 2>/dev/null
 
       - name: Commit and push
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT || github.token }}@github.com/${{ github.repository }}.git
-          git add music-downloads/
+          
+          git add $OUTPUT_DIR/
+          
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
             git commit -m "🎵 $(date +%Y-%m-%d_%H-%M-%S)"
             git push
-            echo "✅ Committed!"
+            echo "✅ Files committed to repository!"
           fi
