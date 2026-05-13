@@ -25,12 +25,13 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Setup Python and tools
+      - name: Install yt-dlp and FFmpeg
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq python3 python3-pip ffmpeg jq
-          pip3 install scdl
-          echo "✅ Tools installed"
+          sudo apt-get install -y -qq ffmpeg
+          curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          chmod +x /usr/local/bin/yt-dlp
+          echo "✅ yt-dlp $(yt-dlp --version)"
 
       - name: Download from SoundCloud
         env:
@@ -40,118 +41,99 @@ jobs:
           mkdir -p $OUTPUT_DIR
           cd $OUTPUT_DIR
           
-          echo "🎵 Downloading from SoundCloud..."
+          echo "🎵 Downloading with yt-dlp..."
           echo "URL: $SC_URL"
+          echo ""
           
-          # Try scdl first
-          scdl \
-            -l "$SC_URL" \
-            --auth-token="$SC_AUTH_TOKEN" \
-            --onlymp3 \
-            --name-format="{user[username]} - {title}" \
-            --no-original 2>&1 || true
+          # Use OAuth token for authentication
+          # Try progressive MP3 first, fallback to HLS
+          yt-dlp \
+            --extract-audio \
+            --audio-format mp3 \
+            --audio-quality 320k \
+            --embed-metadata \
+            --embed-thumbnail \
+            --add-header "Authorization:OAuth $SC_AUTH_TOKEN" \
+            --no-playlist \
+            -o "%(uploader)s - %(title)s.%(ext)s" \
+            --verbose \
+            "$SC_URL" 2>&1 | tee /tmp/yt-dlp.log
           
-          # Check if we got a valid file
-          VALID_FILE=$(find . -name "*.mp3" -size +10k 2>/dev/null | head -1)
+          echo ""
+          echo "📁 Downloaded files:"
+          ls -lh *.mp3 2>/dev/null || echo "No MP3 files yet"
           
-          if [ -z "$VALID_FILE" ]; then
+          # Check if files are valid
+          for f in *.mp3; do
+            if [ -f "$f" ]; then
+              SIZE=$(stat -c%s "$f")
+              if [ "$SIZE" -gt 10000 ]; then
+                echo "✅ Valid: $f ($(echo "scale=1; $SIZE/1048576" | bc)MB)"
+              else
+                echo "⚠️ Invalid (too small): $f"
+                rm "$f"
+              fi
+            fi
+          done
+
+      - name: If yt-dlp failed, try with cookies
+        if: always()
+        env:
+          SC_URL: ${{ github.event.inputs.url }}
+          SC_AUTH_TOKEN: ${{ secrets.SC_AUTH_TOKEN }}
+        run: |
+          VALID_FILES=$(find $OUTPUT_DIR -name "*.mp3" -size +10k 2>/dev/null | wc -l)
+          
+          if [ "$VALID_FILES" -eq 0 ]; then
+            echo "⚠️ First attempt failed, trying alternative method..."
+            
+            cd $OUTPUT_DIR
+            
+            # Try without forcing MP3 - get whatever format is available
+            yt-dlp \
+              --extract-audio \
+              --audio-format best \
+              --embed-metadata \
+              --add-header "Authorization:OAuth $SC_AUTH_TOKEN" \
+              --no-playlist \
+              -o "%(uploader)s - %(title)s.%(ext)s" \
+              "$SC_URL" 2>&1 || true
+            
             echo ""
-            echo "⚠️ scdl didn't produce valid file, trying direct API download..."
+            echo "📁 Files after fallback:"
+            ls -lh *.* 2>/dev/null
             
-            # Clean any invalid files
-            rm -f *.mp3 *.json
-            
-            CLIENT_ID="a3e059563d7fd3372b49b37f00a00bcf"
-            
-            # Get track info using Python script (avoid inline python errors)
-            cat > /tmp/get_track_info.py << 'PYEOF'
-          import sys, json
-
-          data = json.load(sys.stdin)
-          title = data.get('title', 'unknown')
-          artist = data.get('user', {}).get('username', 'unknown')
-          transcodings = data.get('media', {}).get('transcodings', [])
-
-          stream_url = None
-          for t in transcodings:
-              protocol = t.get('format', {}).get('protocol', '')
-              if protocol == 'progressive':
-                  stream_url = t.get('url', '')
-                  break
-
-          # If no progressive, take first available
-          if not stream_url and transcodings:
-              stream_url = transcodings[0].get('url', '')
-
-          print(json.dumps({
-              'title': title,
-              'artist': artist,
-              'stream_url': stream_url
-          }))
-          PYEOF
-            
-            # Resolve URL
-            RESOLVE_URL="https://api-v2.soundcloud.com/resolve?url=${SC_URL}&client_id=${CLIENT_ID}"
-            echo "Resolving URL..."
-            
-            TRACK_INFO=$(curl -s -H "Authorization: OAuth $SC_AUTH_TOKEN" "$RESOLVE_URL")
-            
-            TITLE=$(echo "$TRACK_INFO" | python3 /tmp/get_track_info.py | jq -r '.title')
-            ARTIST=$(echo "$TRACK_INFO" | python3 /tmp/get_track_info.py | jq -r '.artist')
-            STREAM_URL=$(echo "$TRACK_INFO" | python3 /tmp/get_track_info.py | jq -r '.stream_url')
-            
-            echo "Title: $TITLE"
-            echo "Artist: $ARTIST"
-            echo "Stream: $([ -n "$STREAM_URL" ] && echo 'Found' || echo 'Not found')"
-            
-            if [ -n "$STREAM_URL" ] && [ "$STREAM_URL" != "null" ]; then
-              echo "Getting actual stream URL..."
-              ACTUAL_RESPONSE=$(curl -s -H "Authorization: OAuth $SC_AUTH_TOKEN" "${STREAM_URL}?client_id=${CLIENT_ID}")
-              ACTUAL_URL=$(echo "$ACTUAL_RESPONSE" | jq -r '.url // empty')
-              
-              if [ -n "$ACTUAL_URL" ]; then
-                FILENAME=$(echo "${ARTIST} - ${TITLE}" | sed 's/[<>:"/\\|?*]/_/g')
-                echo "Downloading with FFmpeg..."
-                echo "Output: ${FILENAME}.mp3"
-                
-                ffmpeg -i "$ACTUAL_URL" \
+            # Convert any non-MP3 to MP3
+            for f in *.m4* *.ogg *.opus *.webm 2>/dev/null; do
+              if [ -f "$f" ]; then
+                BASENAME="${f%.*}"
+                echo "Converting $f to MP3..."
+                ffmpeg -i "$f" \
                   -c:a libmp3lame \
                   -b:a 320k \
                   -ar 44100 \
-                  -metadata title="$TITLE" \
-                  -metadata artist="$ARTIST" \
                   -y \
-                  "${FILENAME}.mp3" 2>&1 | tail -3
+                  "${BASENAME}.mp3" 2>/dev/null
                 
-                if [ -f "${FILENAME}.mp3" ]; then
-                  SIZE=$(stat -c%s "${FILENAME}.mp3")
-                  echo "✅ Downloaded: ${FILENAME}.mp3 ($(echo "scale=1; $SIZE/1048576" | bc)MB)"
-                else
-                  echo "❌ Failed to create file"
+                if [ -f "${BASENAME}.mp3" ]; then
+                  rm "$f"
+                  echo "✅ Converted: ${BASENAME}.mp3"
                 fi
-              else
-                echo "❌ Could not get actual stream URL"
               fi
-            else
-              echo "❌ No stream URL found"
-            fi
-          else
-            echo "✅ scdl downloaded successfully: $VALID_FILE"
+            done
           fi
-          
-          echo ""
-          echo "📁 Final files:"
-          ls -lh *.mp3 2>/dev/null || echo "No MP3 files"
 
       - name: Commit and push
+        if: always()
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT || github.token }}@github.com/${{ github.repository }}.git
           
-          # Only keep valid MP3 files
+          # Remove invalid/small files
           find $OUTPUT_DIR -name "*.mp3" -size -10k -delete 2>/dev/null || true
-          find $OUTPUT_DIR -name "*.json" -delete 2>/dev/null || true
+          find $OUTPUT_DIR -name "*.part" -delete 2>/dev/null || true
+          find $OUTPUT_DIR -name "*.ytdl" -delete 2>/dev/null || true
           
           git add $OUTPUT_DIR/
           
