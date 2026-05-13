@@ -47,10 +47,11 @@ jobs:
           const puppeteer = require('puppeteer');
           const fs = require('fs');
 
+          const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
           (async () => {
             const artist = process.env.ARTIST;
             const song = process.env.SONG;
-            const limit = parseInt(process.env.LIMIT) || 5;
             const query = song ? `${artist} ${song}` : artist;
             
             console.log(`🔍 Searching SoundCloud for: "${query}"`);
@@ -63,32 +64,51 @@ jobs:
             const page = await browser.newPage();
             await page.setViewport({ width: 1280, height: 800 });
             
-            // Go to SoundCloud search
             const searchUrl = `https://soundcloud.com/search?q=${encodeURIComponent(query)}`;
             console.log(`URL: ${searchUrl}`);
             
             await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
             
-            // Wait for results
-            await page.waitForTimeout(3000);
+            // Wait for results to load
+            await sleep(3000);
+            
+            // Try to click "Tracks" filter if available
+            try {
+              await page.click('a[href*="search/tracks"]');
+              await sleep(2000);
+            } catch(e) {
+              console.log('No tracks filter tab');
+            }
             
             // Extract tracks
             const tracks = await page.evaluate(() => {
               const results = [];
-              const items = document.querySelectorAll('li.searchList__item');
+              // Try multiple selectors
+              const items = document.querySelectorAll(
+                'li.searchList__item, div[class*="searchItem"], div[class*="track"]'
+              );
               
               items.forEach((item, i) => {
                 try {
-                  const link = item.querySelector('a.soundTitle__title');
-                  const artistEl = item.querySelector('a.soundTitle__username');
+                  const link = item.querySelector('a[href*="/"]');
+                  const artistEl = item.querySelector(
+                    'a[class*="username"], span[class*="username"], a[class*="artist"]'
+                  );
+                  const titleEl = item.querySelector(
+                    'a[class*="title"], span[class*="title"], a[class*="soundTitle"]'
+                  );
                   const img = item.querySelector('img');
-                  const durationEl = item.querySelector('.sc-visuallyhidden');
                   
-                  if (link && artistEl) {
+                  const url = link ? link.getAttribute('href') : '';
+                  const title = titleEl ? titleEl.textContent.trim() : '';
+                  const trackArtist = artistEl ? artistEl.textContent.trim() : artist;
+                  
+                  if (url && url.includes('/') && title) {
+                    const fullUrl = url.startsWith('http') ? url : `https://soundcloud.com${url}`;
                     results.push({
-                      title: link.textContent.trim(),
-                      artist: artistEl.textContent.trim(),
-                      url: 'https://soundcloud.com' + link.getAttribute('href'),
+                      title: title,
+                      artist: trackArtist,
+                      url: fullUrl,
                       thumbnail: img ? img.getAttribute('src') : '',
                       index: i + 1
                     });
@@ -108,43 +128,80 @@ jobs:
               process.exit(0);
             }
             
-            console.log(`\n✅ Found ${tracks.length} tracks:\n`);
+            // Remove duplicates
+            const unique = [];
+            const seen = new Set();
+            for (const t of tracks) {
+              const key = t.url;
+              if (!seen.has(key)) {
+                seen.add(key);
+                unique.push(t);
+              }
+            }
+            
+            const finalTracks = unique.slice(0, parseInt(process.env.LIMIT) || 5);
+            
+            console.log(`\n✅ Found ${finalTracks.length} tracks:\n`);
             
             // Save results
             fs.mkdirSync(`results/${artist}`, { recursive: true });
             
-            // README.md
-            let md = `<div align="center">\n\n# 🎵 ${artist}\n\n**${tracks.length} tracks found**\n\n</div>\n\n`;
-            md += '<table>\n<tr><th>#</th><th>Cover</th><th>Track</th><th>Link</th></tr>\n';
+            // README.md with cover art
+            let md = `<div align="center">\n\n# 🎵 ${artist}\n\n`;
+            md += `**${finalTracks.length} tracks found**\n\n`;
+            md += `</div>\n\n`;
+            md += '<table>\n';
+            md += '<tr><th>#</th><th>Cover</th><th>Track</th><th>Link</th></tr>\n';
             
-            let links_txt = `# ${artist} - SoundCloud Links\n\n`;
-            let json_data = [];
+            let links = '';
+            let jsonTracks = [];
             
-            tracks.forEach((t) => {
-              const cover = t.thumbnail ? `<img src="${t.thumbnail}" width="60" height="60" style="border-radius:6px">` : '—';
-              md += `<tr>\n<td>${t.index}</td>\n<td>${cover}</td>\n<td><strong>${t.artist} - ${t.title}</strong></td>\n<td><a href="${t.url}">🔗 Listen</a></td>\n</tr>\n`;
+            finalTracks.forEach((t, i) => {
+              t.index = i + 1;
               
-              links_txt += `${t.url}\n`;
-              json_data.push(t);
+              const cover = t.thumbnail 
+                ? `<img src="${t.thumbnail}" width="60" height="60" style="border-radius:6px">` 
+                : '—';
+              
+              md += `<tr>\n`;
+              md += `<td>${t.index}</td>\n`;
+              md += `<td>${cover}</td>\n`;
+              md += `<td><strong>${t.artist} — ${t.title}</strong></td>\n`;
+              md += `<td><a href="${t.url}" target="_blank">🔗 Listen</a></td>\n`;
+              md += `</tr>\n`;
+              
+              links += `${t.url}\n`;
+              jsonTracks.push(t);
               
               console.log(`${t.index}. ${t.artist} - ${t.title}`);
               console.log(`   🔗 ${t.url}\n`);
             });
             
-            md += '</table>\n\n---\n\n## 📋 Direct Links\n\n';
-            json_data.forEach(t => {
-              md += `- [${t.artist} - ${t.title}](${t.url})\n`;
+            md += '</table>\n\n---\n\n';
+            md += '## 📋 Direct Links\n\n';
+            jsonTracks.forEach(t => {
+              md += `- [${t.artist} — ${t.title}](${t.url})\n`;
             });
             
-            fs.writeFileSync(`results/${artist}/README.md`, md);
-            fs.writeFileSync(`results/${artist}/links.txt`, links_txt);
-            fs.writeFileSync(`results/${artist}/links.json`, JSON.stringify({
-              artist, query, total: tracks.length,
+            md += `\n---\n\n*Generated: ${new Date().toISOString()}*`;
+            
+            // Write files
+            const dir = `results/${artist}`;
+            fs.writeFileSync(`${dir}/README.md`, md);
+            fs.writeFileSync(`${dir}/links.txt`, links);
+            fs.writeFileSync(`${dir}/links.json`, JSON.stringify({
+              artist,
+              query,
+              total: finalTracks.length,
               date: new Date().toISOString(),
-              tracks: json_data
+              tracks: jsonTracks
             }, null, 2));
             
-            console.log(`✅ Saved to results/${artist}/`);
+            console.log(`✅ Files saved:\n`);
+            console.log(`   📄 ${dir}/README.md`);
+            console.log(`   📄 ${dir}/links.txt`);
+            console.log(`   📄 ${dir}/links.json`);
+            
           })();
           SCRIPT
           
@@ -152,9 +209,11 @@ jobs:
 
       - name: Show results
         run: |
-          cat results/$ARTIST/links.txt 2>/dev/null || echo "No results"
-        env:
-          ARTIST: ${{ github.event.inputs.artist }}
+          ARTIST="${{ github.event.inputs.artist }}"
+          echo ""
+          echo "📋 Links:"
+          echo "========="
+          cat "results/$ARTIST/links.txt" 2>/dev/null || echo "No results found"
 
       - name: Commit
         run: |
