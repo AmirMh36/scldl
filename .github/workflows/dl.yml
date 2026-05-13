@@ -1,12 +1,15 @@
-name: 🎧 SoundCloud Private (dl-soundcloud)
+name: 🎧 SoundCloud Private (multidl + FFmpeg)
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'آدرس آهنگ خصوصی'
+        description: 'SoundCloud private track URL'
         required: true
         type: string
+
+env:
+  OUTPUT_DIR: music-downloads
 
 jobs:
   download:
@@ -17,32 +20,80 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Setup Node.js و FFmpeg
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
       - name: نصب ابزارها
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-          pip3 install dl-soundcloud
+          npm install -g multidl-cli
+          echo "✅ multidl-cli نصب شد"
 
       - name: استخراج توکن و دانلود
         env:
+          SC_URL: ${{ github.event.inputs.url }}
           SC_COOKIES: ${{ secrets.SC_COOKIES }}
         run: |
+          mkdir -p "$OUTPUT_DIR"
+          
+          # استخراج توکن از کوکی‌ها
           echo "$SC_COOKIES" > cookies.txt
           OAUTH_TOKEN=$(grep 'oauth_token' cookies.txt | awk '{print $NF}')
           
-          mkdir -p music-downloads
-          cd music-downloads
+          if [ -z "$OAUTH_TOKEN" ]; then
+            echo "❌ توکن پیدا نشد"
+            exit 1
+          fi
           
-          # استفاده از توکن برای دانلود
-          scl "${{ github.event.inputs.url }}" --auth-token "$OAUTH_TOKEN"
+          echo "🔑 توکن: ${OAUTH_TOKEN:0:15}..."
           
-          # تبدیل به MP3 در صورت نیاز
-          for f in *.m4a *.ogg *.opus; do
-            [ -f "$f" ] && ffmpeg -i "$f" -c:a libmp3lame -b:a 320k "${f%.*}.mp3" && rm "$f"
+          cd "$OUTPUT_DIR"
+          
+          # دانلود با multidl (توکن را با echo پاس می‌دهیم)
+          echo "$OAUTH_TOKEN" | multidl \
+            "$SC_URL" \
+            --download-dir . \
+            --quality high 2>&1
+          
+          echo "📁 فایل‌های دانلود شده:"
+          ls -lh
+          
+          # تبدیل M4A به MP3
+          for f in *.m4a *.ogg *.opus *.aac 2>/dev/null; do
+            if [ -f "$f" ] && [ $(stat -c%s "$f") -gt 10240 ]; then
+              BASENAME="${f%.*}"
+              echo "🔄 تبدیل $f به MP3..."
+              ffmpeg -i "$f" \
+                -c:a libmp3lame \
+                -b:a 320k \
+                -ar 44100 \
+                -metadata title="${BASENAME}" \
+                -y \
+                "${BASENAME}.mp3" 2>/dev/null
+              
+              if [ -f "${BASENAME}.mp3" ] && [ $(stat -c%s "${BASENAME}.mp3") -gt 10240 ]; then
+                rm "$f"
+                echo "✅ ${BASENAME}.mp3 ($(du -h "${BASENAME}.mp3" | cut -f1))"
+              fi
+            fi
           done
+          
+          echo "📁 فایل‌های نهایی MP3:"
+          ls -lh *.mp3 2>/dev/null || echo "❌ هیچ فایل MP3 نهایی نشد"
 
-      - name: Commit
+      - name: نمایش فایل‌ها
+        run: ls -lh "$OUTPUT_DIR"
+
+      - name: Commit و Push
+        if: always()
         run: |
+          # حذف فایل‌های غیر MP3
+          find "$OUTPUT_DIR" -type f ! -name "*.mp3" -delete 2>/dev/null || true
+          find "$OUTPUT_DIR" -name "*.mp3" -size -10240c -delete 2>/dev/null || true
+          
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
-          git add music-downloads/
+          git add "$OUTPUT_DIR/"
           git diff --staged --quiet || git commit -m "🎵 $(date +%H:%M)" && git push
