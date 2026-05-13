@@ -41,6 +41,16 @@ jobs:
           cd sc-downloader
           npm init -y
           npm install @snwfdhmp/soundcloud-downloader
+          echo "✅ Dependencies installed"
+          npm ls @snwfdhmp/soundcloud-downloader
+
+      - name: Debug inputs
+        run: |
+          echo "URL: ${{ github.event.inputs.url }}"
+          echo "TYPE: ${{ github.event.inputs.type }}"
+          echo "Workspace: $(pwd)"
+          echo "Node version: $(node --version)"
+          echo "NPM version: $(npm --version)"
 
       - name: Create download script
         run: |
@@ -53,89 +63,162 @@ jobs:
           const TYPE = process.env.SC_TYPE;
           const OUTPUT_DIR = process.env.OUTPUT_DIR || 'downloads';
 
+          console.log('=== DEBUG INFO ===');
+          console.log('URL:', URL);
+          console.log('TYPE:', TYPE);
+          console.log('OUTPUT_DIR:', OUTPUT_DIR);
+          console.log('CWD:', process.cwd());
+          console.log('=================\n');
+
           if (!fs.existsSync(OUTPUT_DIR)) {
             fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+            console.log(`Created directory: ${OUTPUT_DIR}`);
           }
 
-          // clean filename helper
           function cleanName(str, maxLen = 80) {
             return str
               .replace(/[<>:"/\\|?*]/g, '')
               .replace(/['']/g, "'")
               .replace(/[""]/g, '"')
               .trim()
-              .substring(0, maxLen);
+              .substring(0, maxLen) || 'unknown';
           }
 
           async function downloadSingleTrack(trackUrl) {
-            const info = await scdl.getInfo(trackUrl);
-            const fileName = cleanName(`${info.user.username} - ${info.title}`) + '.mp3';
+            console.log(`\n📥 Getting info for: ${trackUrl}`);
+            
+            let info;
+            try {
+              info = await scdl.getInfo(trackUrl);
+              console.log(`   Title: ${info.title}`);
+              console.log(`   Artist: ${info.user?.username}`);
+              console.log(`   Duration: ${info.duration}ms`);
+              console.log(`   Downloadable: ${info.downloadable}`);
+            } catch (err) {
+              console.error('❌ Failed to get track info:', err.message);
+              throw err;
+            }
+
+            const fileName = cleanName(`${info.user?.username || 'unknown'} - ${info.title || 'unknown'}`) + '.mp3';
             const filePath = path.join(OUTPUT_DIR, fileName);
+            console.log(`   Output: ${filePath}`);
 
-            console.log(`  ⬇ ${info.user.username} - ${info.title}`);
+            try {
+              const stream = await scdl.download(trackUrl);
+              console.log('   Stream received, writing to file...');
+              
+              const writeStream = fs.createWriteStream(filePath);
+              
+              let downloadedBytes = 0;
+              stream.on('data', (chunk) => {
+                downloadedBytes += chunk.length;
+                if (downloadedBytes % (1024 * 100) === 0) {  // log every 100KB
+                  console.log(`   Downloaded: ${(downloadedBytes / 1024 / 1024).toFixed(2)} MB`);
+                }
+              });
+              
+              stream.pipe(writeStream);
 
-            const stream = await scdl.download(trackUrl);
-            const writeStream = fs.createWriteStream(filePath);
-            stream.pipe(writeStream);
+              await new Promise((resolve, reject) => {
+                writeStream.on('finish', () => {
+                  console.log(`   Total: ${(downloadedBytes / 1024 / 1024).toFixed(2)} MB`);
+                  resolve();
+                });
+                writeStream.on('error', reject);
+                stream.on('error', reject);
+              });
 
-            await new Promise((resolve, reject) => {
-              writeStream.on('finish', resolve);
-              writeStream.on('error', reject);
-            });
-
-            console.log(`  ✓ Saved: ${fileName}`);
-            return { fileName, info };
+              console.log(`   ✅ File saved: ${fileName}`);
+              
+              // Verify file exists and has size
+              if (fs.existsSync(filePath)) {
+                const stats = fs.statSync(filePath);
+                console.log(`   File size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+                if (stats.size === 0) {
+                  throw new Error('Downloaded file is empty (0 bytes)');
+                }
+              } else {
+                throw new Error('File was not created');
+              }
+              
+              return { fileName, filePath, info };
+            } catch (err) {
+              console.error('❌ Download failed:', err.message);
+              throw err;
+            }
           }
 
           async function main() {
-            console.log(`\n🎵 SoundCloud Downloader`);
-            console.log(`   Type: ${TYPE}`);
-            console.log(`   URL:  ${URL}\n`);
+            console.log('\n🎵 SoundCloud Downloader Starting...\n');
 
             const results = [];
 
-            if (TYPE === 'track') {
-              const result = await downloadSingleTrack(URL);
-              results.push(result);
-            } else if (TYPE === 'playlist') {
-              console.log('📋 Fetching playlist info...');
-              const playlist = await scdl.getSetInfo(URL);
-              console.log(`   Found: ${playlist.title} (${playlist.tracks.length} tracks)\n`);
-
-              for (let i = 0; i < playlist.tracks.length; i++) {
-                console.log(`[${i + 1}/${playlist.tracks.length}]`);
-                const result = await downloadSingleTrack(playlist.tracks[i].permalink_url);
+            try {
+              if (TYPE === 'track') {
+                const result = await downloadSingleTrack(URL);
                 results.push(result);
+              } else if (TYPE === 'playlist') {
+                console.log('📋 Fetching playlist info...');
+                const playlist = await scdl.getSetInfo(URL);
+                console.log(`   Playlist: ${playlist.title}`);
+                console.log(`   Tracks: ${playlist.tracks.length}\n`);
+
+                for (let i = 0; i < playlist.tracks.length; i++) {
+                  console.log(`\n[${i + 1}/${playlist.tracks.length}]`);
+                  try {
+                    const result = await downloadSingleTrack(playlist.tracks[i].permalink_url);
+                    results.push(result);
+                  } catch (err) {
+                    console.error(`   ⚠️ Skipping track ${i + 1}: ${err.message}`);
+                  }
+                }
               }
+
+              // Write summary
+              const summary = {
+                downloadedAt: new Date().toISOString(),
+                sourceUrl: URL,
+                type: TYPE,
+                totalTracks: results.length,
+                files: results.map((r) => ({
+                  file: r.fileName,
+                  title: r.info?.title || 'unknown',
+                  artist: r.info?.user?.username || 'unknown',
+                  duration: r.info?.duration,
+                  size: fs.statSync(r.filePath).size,
+                })),
+              };
+
+              const summaryPath = path.join(OUTPUT_DIR, 'download-summary.json');
+              fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
+              console.log(`\n📊 Summary saved to: ${summaryPath}`);
+
+              // List all files in output dir
+              console.log('\n📁 Files in output directory:');
+              const files = fs.readdirSync(OUTPUT_DIR);
+              files.forEach((f) => {
+                const stat = fs.statSync(path.join(OUTPUT_DIR, f));
+                console.log(`   - ${f} (${(stat.size / 1024 / 1024).toFixed(2)} MB)`);
+              });
+
+              console.log(`\n✅ Done! ${results.length} file(s) downloaded.`);
+              
+              if (results.length === 0) {
+                console.error('❌ No files were downloaded successfully!');
+                process.exit(1);
+              }
+            } catch (err) {
+              console.error('\n❌ Fatal error in main:', err.message);
+              console.error(err.stack);
+              process.exit(1);
             }
-
-            // write summary
-            const summary = {
-              downloadedAt: new Date().toISOString(),
-              sourceUrl: URL,
-              type: TYPE,
-              totalTracks: results.length,
-              files: results.map((r) => ({
-                file: r.fileName,
-                title: r.info.title,
-                artist: r.info.user.username,
-                duration: r.info.duration,
-              })),
-            };
-
-            fs.writeFileSync(
-              path.join(OUTPUT_DIR, 'download-summary.json'),
-              JSON.stringify(summary, null, 2)
-            );
-
-            console.log(`\n✅ Done! ${results.length} file(s) downloaded.`);
           }
 
-          main().catch((err) => {
-            console.error('❌ Fatal error:', err.message);
-            process.exit(1);
-          });
+          main();
           SCRIPT_EOF
+          
+          echo "✅ Script created"
+          wc -l sc-downloader/download.js
 
       - name: Run downloader
         working-directory: sc-downloader
@@ -144,21 +227,41 @@ jobs:
           SC_TYPE: ${{ github.event.inputs.type }}
         run: node download.js
 
+      - name: Check output files
+        if: always()
+        run: |
+          echo "=== Checking output ==="
+          if [ -d "sc-downloader/downloads" ]; then
+            echo "Downloads directory exists"
+            ls -lah sc-downloader/downloads/
+            echo "Total files: $(ls -1 sc-downloader/downloads/ | wc -l)"
+          else
+            echo "❌ Downloads directory NOT found!"
+            echo "Current directory contents:"
+            ls -la sc-downloader/
+          fi
+
       - name: Upload downloaded files
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: soundcloud-downloads-${{ github.run_id }}
           path: sc-downloader/downloads/
           retention-days: 7
           compression-level: 0
+          if-no-files-found: warn
 
-      - name: Show summary
+      - name: Show summary in job summary
+        if: always()
         run: |
+          echo "## 📊 SoundCloud Download Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f sc-downloader/downloads/download-summary.json ]; then
-            echo "## 📊 Download Summary" >> $GITHUB_STEP_SUMMARY
             echo '```json' >> $GITHUB_STEP_SUMMARY
             cat sc-downloader/downloads/download-summary.json >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "📥 [Download Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ No summary file found" >> $GITHUB_STEP_SUMMARY
           fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📥 **[Download Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})**" >> $GITHUB_STEP_SUMMARY
