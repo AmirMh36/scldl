@@ -1,109 +1,194 @@
-name: 🎵 SoundCloud Downloader
+name: 🎧 SoundCloud Downloader Pro
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'SoundCloud share URL (e.g., https://soundcloud.com/...?si=...)'
+        description: 'SoundCloud share URL'
         required: true
         type: string
-      oauth_token:
-        description: 'OAuth token (برای آهنگ‌های خصوصی)'
-        required: false
-        type: string
-
-env:
-  OUTPUT_DIR: music-downloads
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   download:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
 
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '24'
-
-      - name: نصب ابزارها
+      - name: نصب پیش‌نیازها
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg curl
           npm init -y
-          npm install btch-downloader
+          npm install puppeteer
 
-      - name: دریافت لینک دانلود و بارگیری
+      - name: دانلود از SoundCloud
         env:
           SC_URL: ${{ github.event.inputs.url }}
-          SC_AUTH_TOKEN: ${{ github.event.inputs.oauth_token }}
         run: |
-          mkdir -p $OUTPUT_DIR
+          mkdir -p music-downloads
           
           cat > download.js << 'SCRIPT'
-          const { soundcloud } = require('btch-downloader');
-          const { execSync } = require('child_process');
+          const puppeteer = require('puppeteer');
+          const https = require('https');
           const fs = require('fs');
+          const { execSync } = require('child_process');
+          const path = require('path');
 
-          const url = process.env.SC_URL;
-          const token = process.env.SC_AUTH_TOKEN || '';
+          const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-          console.log('🔗 دریافت اطلاعات آهنگ...');
-          soundcloud(url)
-            .then(data => {
-              // استخراج لینک مستقیم MP3
-              const downloadUrl = data?.result?.downloadMp3 || data?.result?.audio || '';
-              if (!downloadUrl || !downloadUrl.startsWith('http')) {
-                console.error('❌ لینک دانلود پیدا نشد. ممکن است آهنگ خصوصی باشد.');
-                if (data?.result?.title) console.log('عنوان:', data.result.title);
-                process.exit(1);
-              }
+          const targetUrl = process.env.SC_URL;
+          const outputDir = 'music-downloads';
 
-              const title = (data.result.title || 'soundcloud_track')
-                .replace(/[<>:"/\\|?*]/g, '')
-                .substring(0, 80);
-              
-              const outputFile = `${process.env.OUTPUT_DIR}/${title}.mp3`;
-
-              console.log(`⬇️ در حال دانلود: ${title}`);
-              // curl مستقیم فایل MP3
-              execSync(`curl -L --retry 3 -o "${outputFile}" "${downloadUrl}"`, { stdio: 'inherit' });
-
-              if (fs.existsSync(outputFile)) {
-                const sizeMB = (fs.statSync(outputFile).size / 1_048_576).toFixed(1);
-                if (parseFloat(sizeMB) < 0.01) {
-                  console.error('❌ فایل دانلود شده خالی است.');
-                  process.exit(1);
-                }
-                console.log(`✅ دانلود کامل: ${title}.mp3 (${sizeMB} MB)`);
-              } else {
-                console.error('❌ فایل ایجاد نشد.');
-                process.exit(1);
-              }
-            })
-            .catch(err => {
-              console.error('❌ خطا:', err.message);
-              process.exit(1);
+          // تابع کمکی: دریافت محتوای URL
+          function fetch(url) {
+            return new Promise((resolve, reject) => {
+              https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => resolve(data));
+              }).on('error', reject);
             });
+          }
+
+          async function getClientId(page) {
+            try {
+              await page.goto('https://soundcloud.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+              const html = await page.content();
+              const match = html.match(/client_id\s*:\s*"([^"]+)"/);
+              return match ? match[1] : null;
+            } catch { return null; }
+          }
+
+          async function main() {
+            console.log('🎯 لینک ورودی:', targetUrl);
+
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage']
+            });
+            const page = await browser.newPage();
+
+            let downloadUrl = null;
+            let title = 'soundcloud_track';
+            let artist = 'Unknown';
+
+            // روش 1: استخراج از API با client_id زنده
+            try {
+              const clientId = await getClientId(page);
+              if (clientId) {
+                console.log('🔑 Client ID:', clientId);
+                const resolveUrl = `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(targetUrl)}&client_id=${clientId}`;
+                const resp = await fetch(resolveUrl);
+                const data = JSON.parse(resp);
+                title = data.title || title;
+                artist = data.user?.username || artist;
+
+                // جستجوی progressive stream
+                const transcodings = data.media?.transcodings || [];
+                const progressive = transcodings.find(t => t.format?.protocol === 'progressive');
+                if (progressive) {
+                  const streamInfo = await fetch(progressive.url + '?client_id=' + clientId);
+                  const streamData = JSON.parse(streamInfo);
+                  downloadUrl = streamData.url;
+                  console.log('✅ لینک progressive پیدا شد');
+                }
+              }
+            } catch(e) {
+              console.log('⚠️ API ناموفق:', e.message);
+            }
+
+            // روش 2: اگر API نداد، با Puppeteer از صفحه آهنگ استخراج کن
+            if (!downloadUrl) {
+              try {
+                console.log('🔄 تلاش با مرورگر...');
+                await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+                await sleep(3000);
+
+                // استخراج اطلاعات از meta tags
+                const metadata = await page.evaluate(() => {
+                  const getMeta = (name) => {
+                    const el = document.querySelector(`meta[property="og:${name}"]`);
+                    return el ? el.getAttribute('content') : '';
+                  };
+                  return {
+                    title: getMeta('title'),
+                    artist: document.querySelector('meta[property="soundcloud:author"]')?.getAttribute('content') || '',
+                    image: getMeta('image')
+                  };
+                });
+                title = metadata.title || title;
+                artist = metadata.artist || artist;
+
+                // رهگیری درخواست‌های صوتی
+                await page.setRequestInterception(true);
+                const audioUrls = [];
+                page.on('request', req => {
+                  const url = req.url();
+                  if (url.includes('.mp3') || url.includes('/media/') || url.includes('/stream/')) {
+                    audioUrls.push(url);
+                    console.log('🎵 پیدا شد:', url.substring(0, 100));
+                  }
+                  req.continue();
+                });
+
+                // کلیک روی دکمه پخش برای فعال شدن استریم
+                const playBtn = await page.$('button.playControl');
+                if (playBtn) {
+                  await playBtn.click();
+                  await sleep(5000);
+                }
+
+                if (audioUrls.length > 0) {
+                  downloadUrl = audioUrls.find(u => u.includes('.mp3') || u.includes('/media/'));
+                }
+              } catch(e) {
+                console.log('⚠️ مرورگر ناموفق:', e.message);
+              }
+            }
+
+            await browser.close();
+
+            if (!downloadUrl) {
+              console.error('❌ هیچ لینک دانلودی پیدا نشد.');
+              process.exit(1);
+            }
+
+            // آماده‌سازی نام فایل
+            const safeName = (artist + ' - ' + title).replace(/[<>:"/\\|?*]/g, '').substring(0, 100);
+            const outPath = path.join(outputDir, safeName + '.mp3');
+
+            console.log(`⬇️ دانلود "${safeName}"...`);
+            // با ffmpeg دانلود و تبدیل به MP3
+            execSync(`ffmpeg -i "${downloadUrl}" -c:a libmp3lame -b:a 320k -ar 44100 -y "${outPath}"`, { stdio: 'inherit' });
+
+            if (fs.existsSync(outPath)) {
+              const sizeMB = (fs.statSync(outPath).size / 1_048_576).toFixed(1);
+              console.log(`✅ ذخیره شد: ${safeName}.mp3 (${sizeMB} MB)`);
+            } else {
+              console.error('❌ فایل نهایی ایجاد نشد.');
+              process.exit(1);
+            }
+          }
+
+          main().catch(e => {
+            console.error('💥 خطای کلی:', e.message);
+            process.exit(1);
+          });
           SCRIPT
           
           node download.js
 
-      - name: نمایش فایل نهایی
-        run: |
-          echo ""
-          echo "📁 فایل‌های دانلود شده:"
-          ls -lh $OUTPUT_DIR/*.mp3 2>/dev/null || echo "هنوز فایلی وجود ندارد"
+      - name: نمایش فایل‌ها
+        run: ls -lh music-downloads/
 
-      - name: commit و push
+      - name: ذخیره در ریپازیتوری
         if: always()
         run: |
-          # حذف فایل‌های خراب (کمتر از ۱۰ کیلوبایت)
-          find $OUTPUT_DIR -name "*.mp3" -size -10240c -delete 2>/dev/null || true
-          
+          find music-downloads -name "*.mp3" -size -10240c -delete
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
-          git add $OUTPUT_DIR/
+          git add music-downloads/
           git diff --staged --quiet || git commit -m "🎵 $(date +%H:%M)" && git push
