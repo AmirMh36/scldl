@@ -8,17 +8,8 @@ on:
         description: 'SoundCloud track or playlist URL'
         required: true
         type: string
-      type:
-        description: 'Type (track or playlist)'
-        required: true
-        type: choice
-        options:
-          - track
-          - playlist
-        default: 'track'
 
 env:
-  OUTPUT_DIR: downloads
   NODE_VERSION: '20'
 
 jobs:
@@ -41,205 +32,99 @@ jobs:
 
       - name: Install FFmpeg
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          ffmpeg -version | head -n 1
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg jq
           echo "✅ FFmpeg installed"
 
-      - name: Create project and install dependency
-        run: |
-          mkdir -p sc-downloader
-          cd sc-downloader
-          npm init -y
-          npm install @snwfdhmp/soundcloud-downloader
-          npm install fluent-ffmpeg
-
-      - name: Create download script
-        run: |
-          cat > sc-downloader/download.js << 'SCRIPT_EOF'
-          const fs = require('fs');
-          const path = require('path');
-          const { execSync } = require('child_process');
-          const scdl = require('@snwfdhmp/soundcloud-downloader').default;
-
-          const URL = process.env.SC_URL;
-          const TYPE = process.env.SC_TYPE;
-          const OUTPUT_DIR = process.env.OUTPUT_DIR || 'downloads';
-
-          if (!fs.existsSync(OUTPUT_DIR)) {
-            fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-          }
-
-          function cleanName(str, maxLen = 80) {
-            return str
-              .replace(/[<>:"/\\|?*]/g, '')
-              .replace(/['']/g, "'")
-              .replace(/[""]/g, '"')
-              .replace(/\//g, '-')
-              .trim()
-              .substring(0, maxLen) || 'unknown';
-          }
-
-          function convertToMp3(inputPath, outputPath) {
-            console.log('  🔄 Converting to MP3...');
-            try {
-              execSync(
-                `ffmpeg -i "${inputPath}" -codec:a libmp3lame -q:a 2 -y "${outputPath}"`,
-                { stdio: 'pipe', timeout: 60000 }
-              );
-              const stats = fs.statSync(outputPath);
-              console.log(`  ✅ MP3 saved: ${outputPath} (${(stats.size / 1024 / 1024).toFixed(1)} MB)`);
-              return true;
-            } catch (err) {
-              console.error('  ⚠️ FFmpeg conversion failed:', err.message);
-              return false;
-            }
-          }
-
-          function detectFormat(filePath) {
-            try {
-              const result = execSync(
-                `ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "${filePath}"`,
-                { encoding: 'utf8', timeout: 10000 }
-              ).trim();
-              return result;
-            } catch {
-              return 'unknown';
-            }
-          }
-
-          async function downloadSingleTrack(trackUrl) {
-            const info = await scdl.getInfo(trackUrl);
-            const baseName = cleanName(`${info.user?.username || 'unknown'} - ${info.title || 'unknown'}`);
-            
-            // Step 1: Download original file
-            const tempFile = path.join(OUTPUT_DIR, `${baseName}_temp`);
-            console.log(`  ⬇ Downloading: ${info.user?.username} - ${info.title}`);
-
-            const stream = await scdl.download(trackUrl);
-            const writeStream = fs.createWriteStream(tempFile);
-            stream.pipe(writeStream);
-
-            await new Promise((resolve, reject) => {
-              writeStream.on('finish', resolve);
-              writeStream.on('error', reject);
-              stream.on('error', reject);
-            });
-
-            const originalSize = fs.statSync(tempFile).size;
-            const originalFormat = detectFormat(tempFile);
-            console.log(`  📥 Downloaded: ${(originalSize / 1024 / 1024).toFixed(1)} MB (format: ${originalFormat})`);
-
-            // Step 2: Convert to MP3
-            const finalFile = path.join(OUTPUT_DIR, `${baseName}.mp3`);
-            
-            if (originalFormat === 'mp3') {
-              // Already MP3, just rename
-              fs.renameSync(tempFile, finalFile);
-              console.log(`  ✅ Already MP3, saved as: ${baseName}.mp3`);
-            } else {
-              // Convert to MP3
-              const success = convertToMp3(tempFile, finalFile);
-              if (success) {
-                // Delete temp file
-                fs.unlinkSync(tempFile);
-              } else {
-                // Keep original if conversion fails
-                const ext = originalFormat || 'audio';
-                const fallbackFile = path.join(OUTPUT_DIR, `${baseName}.${ext}`);
-                fs.renameSync(tempFile, fallbackFile);
-                console.log(`  ⚠️ Saved original format: ${baseName}.${ext}`);
-                return { 
-                  fileName: `${baseName}.${ext}`, 
-                  filePath: fallbackFile, 
-                  info,
-                  format: originalFormat
-                };
-              }
-            }
-
-            // Add metadata tags
-            console.log('  🏷️ Adding metadata...');
-            try {
-              execSync(
-                `ffmpeg -i "${finalFile}" -metadata title="${info.title || ''}" -metadata artist="${info.user?.username || ''}" -metadata album="${info.user?.username || 'SoundCloud'}" -codec copy -y "${finalFile}.tmp" 2>/dev/null`,
-                { timeout: 10000 }
-              );
-              fs.renameSync(`${finalFile}.tmp`, finalFile);
-            } catch (e) {
-              console.log('  ⚠️ Metadata tagging skipped');
-            }
-
-            return { fileName: `${baseName}.mp3`, filePath: finalFile, info, format: 'mp3' };
-          }
-
-          async function main() {
-            console.log('\n🎵 SoundCloud Downloader (MP3 Converter)\n');
-
-            const results = [];
-            if (TYPE === 'track') {
-              const result = await downloadSingleTrack(URL);
-              results.push(result);
-            } else {
-              const playlist = await scdl.getSetInfo(URL);
-              console.log(`📋 Playlist: ${playlist.title} (${playlist.tracks.length} tracks)\n`);
-              for (let i = 0; i < playlist.tracks.length; i++) {
-                console.log(`[${i + 1}/${playlist.tracks.length}]`);
-                try {
-                  const result = await downloadSingleTrack(playlist.tracks[i].permalink_url);
-                  results.push(result);
-                } catch (err) {
-                  console.error(`  ⚠️ Skipped: ${err.message}`);
-                }
-              }
-            }
-
-            // Write summary
-            const summary = {
-              date: new Date().toISOString(),
-              source: URL,
-              type: TYPE,
-              totalTracks: results.length,
-              files: results.map(r => ({
-                file: r.fileName,
-                format: r.format,
-                title: r.info?.title || 'unknown',
-                artist: r.info?.user?.username || 'unknown',
-                duration: r.info?.duration ? `${Math.floor(r.info.duration / 1000)}s` : 'unknown',
-                size: fs.statSync(r.filePath).size
-              }))
-            };
-
-            fs.writeFileSync(
-              path.join(OUTPUT_DIR, 'summary.json'),
-              JSON.stringify(summary, null, 2)
-            );
-
-            console.log(`\n✅ Done! ${results.length} file(s) downloaded in MP3 format.`);
-          }
-
-          main().catch(err => {
-            console.error('❌ Fatal error:', err.message);
-            process.exit(1);
-          });
-          SCRIPT_EOF
-
-      - name: Run downloader
-        working-directory: sc-downloader
+      - name: Download from SoundCloud
         env:
           SC_URL: ${{ github.event.inputs.url }}
-          SC_TYPE: ${{ github.event.inputs.type }}
-        run: node download.js
-
-      - name: Copy files to repo
         run: |
           mkdir -p music-downloads
-          cp sc-downloader/downloads/*.mp3 music-downloads/ 2>/dev/null || true
-          cp sc-downloader/downloads/*.json music-downloads/ 2>/dev/null || true
-          echo "Files in music-downloads:"
-          ls -lh music-downloads/
+          
+          # Get SoundCloud Client ID (public, no auth needed)
+          echo "🔑 Getting SoundCloud client ID..."
+          CLIENT_ID=$(curl -s "https://soundcloud.com" | grep -oP 'client_id:\s*"\K[^"]+' | head -1)
+          
+          if [ -z "$CLIENT_ID" ]; then
+            # Fallback - a known working public client ID pattern
+            CLIENT_ID="a3e059563d7fd3372b49b37f00a00bcf"
+          fi
+          
+          echo "Client ID: $CLIENT_ID"
+          
+          # Resolve the URL to get track info
+          echo "🔍 Resolving URL..."
+          RESOLVE_URL="https://api-v2.soundcloud.com/resolve?url=${SC_URL}&client_id=${CLIENT_ID}"
+          
+          TRACK_INFO=$(curl -s "$RESOLVE_URL")
+          
+          TITLE=$(echo "$TRACK_INFO" | jq -r '.title // "Unknown"')
+          ARTIST=$(echo "$TRACK_INFO" | jq -r '.user.username // "Unknown"')
+          STREAM_URL=$(echo "$TRACK_INFO" | jq -r '.media.transcodings[] | select(.format.protocol == "progressive") | .url' | head -1)
+          
+          # If no progressive stream, try HLS
+          if [ -z "$STREAM_URL" ] || [ "$STREAM_URL" = "null" ]; then
+            echo "No progressive stream, trying HLS..."
+            STREAM_URL=$(echo "$TRACK_INFO" | jq -r '.media.transcodings[0].url // ""')
+          fi
+          
+          echo "Title: $TITLE"
+          echo "Artist: $ARTIST"
+          echo "Stream URL found: $([ -n "$STREAM_URL" ] && echo 'Yes' || echo 'No')"
+          
+          if [ -z "$STREAM_URL" ] || [ "$STREAM_URL" = "null" ]; then
+            echo "❌ No stream URL found"
+            exit 1
+          fi
+          
+          # Get actual stream URL
+          echo "🔗 Getting stream URL..."
+          STREAM_RESPONSE=$(curl -s "${STREAM_URL}?client_id=${CLIENT_ID}")
+          ACTUAL_URL=$(echo "$STREAM_RESPONSE" | jq -r '.url // ""')
+          
+          if [ -z "$ACTUAL_URL" ] || [ "$ACTUAL_URL" = "null" ]; then
+            echo "❌ Could not get actual stream URL"
+            exit 1
+          fi
+          
+          echo "Actual URL obtained"
+          
+          # Clean filename
+          FILENAME=$(echo "${ARTIST} - ${TITLE}" | sed 's/[<>:"/\\|?*]/_/g')
+          
+          # Download and convert with FFmpeg
+          echo "⬇ Downloading and converting to MP3..."
+          ffmpeg -i "$ACTUAL_URL" \
+            -codec:a libmp3lame \
+            -b:a 320k \
+            -ar 44100 \
+            -metadata title="$TITLE" \
+            -metadata artist="$ARTIST" \
+            -metadata album="SoundCloud" \
+            -y \
+            "music-downloads/${FILENAME}.mp3" 2>&1 | tail -5
+          
+          if [ -f "music-downloads/${FILENAME}.mp3" ]; then
+            SIZE=$(du -h "music-downloads/${FILENAME}.mp3" | cut -f1)
+            echo "✅ Downloaded: ${FILENAME}.mp3 ($SIZE)"
+          else
+            echo "❌ Download failed"
+            exit 1
+          fi
+          
+          # Create summary
+          cat > music-downloads/summary.json << EOF
+          {
+            "date": "$(date -Iseconds)",
+            "source": "$SC_URL",
+            "title": "$TITLE",
+            "artist": "$ARTIST",
+            "filename": "${FILENAME}.mp3"
+          }
+          EOF
 
-      - name: Commit and push files
+      - name: Commit and push
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
@@ -250,14 +135,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "🎵 Downloaded (MP3): $(date +%Y-%m-%d_%H-%M-%S)"
+            git commit -m "🎵 $(date +%Y-%m-%d_%H-%M-%S)"
             git push
-            echo "✅ MP3 files committed to repository!"
+            echo "✅ Committed!"
           fi
-
-      - name: Upload artifacts (backup)
-        uses: actions/upload-artifact@v4
-        with:
-          name: soundcloud-mp3-${{ github.run_id }}
-          path: music-downloads/
-          retention-days: 3
