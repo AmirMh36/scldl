@@ -1,4 +1,4 @@
-name: SoundCloud Search 2
+name: SoundCloud  2
 
 on:
   workflow_dispatch:
@@ -118,7 +118,6 @@ jobs:
                   title: getMeta('title'),
                   image: getMeta('image'),
                   description: getMeta('description'),
-                  // تاریخ انتشار در SoundCloud معمولاً در تگ script موجود است
                   date: (() => {
                     const scripts = document.querySelectorAll('script');
                     for (const s of scripts) {
@@ -246,17 +245,14 @@ jobs:
             const enrichedTracks = [];
             for (const t of tracks.slice(0, limit)) {
               console.log(`   Processing: ${t.title}`);
-              // سعی با API (اگر clientId داریم)
               let extra = null;
               if (clientId) {
                 extra = await enrichViaApi(t, clientId);
               }
-              // اگر API جواب نداد، مستقیماً به صفحه آهنگ مراجعه کن
               if (!extra) {
                 extra = await enrichViaPage(browser, t.url);
               }
 
-              // اعمال مقادیر
               t.created_at = extra?.created_at || '';
               t.thumbnail = extra?.artwork_url || '';
               if (extra?.duration) {
@@ -270,7 +266,17 @@ jobs:
 
             await browser.close();
 
-            // 6. آماده‌سازی نهایی و ذخیره
+            // 6. مرتب‌سازی بر اساس تاریخ انتشار (جدیدترین اول)
+            enrichedTracks.sort((a, b) => {
+              const dateA = a.created_at || '';
+              const dateB = b.created_at || '';
+              if (!dateA && !dateB) return 0;
+              if (!dateA) return 1;  // بدون تاریخ می‌ره آخر
+              if (!dateB) return -1;
+              return new Date(dateB) - new Date(dateA);
+            });
+
+            // 7. آماده‌سازی نهایی و ذخیره
             const finalTracks = enrichedTracks.map((t, i) => ({
               ...t,
               shareUrl: t.url + '?si=' + randomSi() + '&utm_source=clipboard&utm_medium=text&utm_campaign=social_sharing',
@@ -287,9 +293,9 @@ jobs:
               process.exit(0);
             }
 
-            let md = `<div align="center">\n\n# 🎵 ${artist}\n\n**${finalTracks.length} tracks**\n\n</div>\n\n`;
+            let md = `<div align="center">\n\n# 🎵 ${artist}\n\n**${finalTracks.length} tracks** · Sorted by newest\n\n</div>\n\n`;
             md += '<table>\n<tr><th>#</th><th>Cover</th><th>Track</th><th>Duration</th><th>Date</th><th>Share Link</th></tr>\n';
-            let linksTxt = `# ${artist}\n\n`;
+            let linksTxt = `# ${artist} (sorted by newest)\n\n`;
             let jsonTracks = [];
 
             finalTracks.forEach(t => {
