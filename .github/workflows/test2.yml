@@ -60,6 +60,19 @@ jobs:
           const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
           const randomSi = () => Array.from({length: 32}, () => Math.floor(Math.random() * 16).toString(16)).join('');
 
+          // استخراج client_id از صفحه اصلی SoundCloud
+          async function getClientIdFromPage(page) {
+            try {
+              await page.goto('https://soundcloud.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+              const html = await page.content();
+              const match = html.match(/client_id\s*:\s*"([^"]+)"/);
+              return match ? match[1] : null;
+            } catch(e) {
+              return null;
+            }
+          }
+
+          // درخواست API با client_id داده شده
           function apiRequest(url) {
             return new Promise((resolve, reject) => {
               https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
@@ -73,24 +86,60 @@ jobs:
             });
           }
 
-          async function enrichTrack(track) {
+          // دریافت اطلاعات از API (resolve)
+          async function enrichViaApi(track, clientId) {
+            if (!clientId) return null;
             try {
-              const resolveUrl = `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(track.url)}&client_id=a3e059563d7fd3372b49b37f00a00bcf`;
+              const resolveUrl = `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(track.url)}&client_id=${clientId}`;
               const data = await apiRequest(resolveUrl);
               if (data && data.created_at) {
-                track.created_at = data.created_at;
-              }
-              if (data && data.artwork_url) {
-                track.thumbnail = data.artwork_url.replace('large', 't500x500');
-              }
-              if (data && data.duration) {
-                track.duration_ms = data.duration;
-                const mins = Math.floor(data.duration / 60000);
-                const secs = Math.floor((data.duration % 60000) / 1000);
-                track.duration = `${mins}:${secs.toString().padStart(2,'0')}`;
+                return {
+                  created_at: data.created_at,
+                  artwork_url: (data.artwork_url || '').replace('large', 't500x500'),
+                  duration: data.duration
+                };
               }
             } catch(e) {}
-            return track;
+            return null;
+          }
+
+          // دریافت اطلاعات از صفحه آهنگ (fallback)
+          async function enrichViaPage(browser, url) {
+            const page = await browser.newPage();
+            try {
+              await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
+              await sleep(1500);
+              const metadata = await page.evaluate(() => {
+                const getMeta = (prop) => {
+                  const el = document.querySelector(`meta[property="og:${prop}"]`) || document.querySelector(`meta[name="${prop}"]`);
+                  return el ? el.getAttribute('content') : '';
+                };
+                return {
+                  title: getMeta('title'),
+                  image: getMeta('image'),
+                  description: getMeta('description'),
+                  // تاریخ انتشار در SoundCloud معمولاً در تگ script موجود است
+                  date: (() => {
+                    const scripts = document.querySelectorAll('script');
+                    for (const s of scripts) {
+                      const text = s.textContent;
+                      const match = text.match(/"created_at"\s*:\s*"([^"]+)"/);
+                      if (match) return match[1];
+                    }
+                    return '';
+                  })()
+                };
+              });
+              await page.close();
+              return {
+                created_at: metadata.date || '',
+                artwork_url: metadata.image ? metadata.image.replace('large', 't500x500') : '',
+                duration: null
+              };
+            } catch(e) {
+              await page.close();
+              return null;
+            }
           }
 
           (async () => {
@@ -113,7 +162,11 @@ jobs:
             const page = await browser.newPage();
             await page.setViewport({ width: 1280, height: 900 });
 
-            // 1. پیدا کردن پروفایل هنرمند
+            // 1. استخراج client_id زنده
+            const clientId = await getClientIdFromPage(page);
+            console.log(`🔑 Client ID: ${clientId || 'not found (will use fallback)'}\n`);
+
+            // 2. پیدا کردن پروفایل هنرمند
             const peopleSearchUrl = `https://soundcloud.com/search/people?q=${encodeURIComponent(artist)}`;
             await page.goto(peopleSearchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
             await sleep(3000);
@@ -147,18 +200,17 @@ jobs:
             }
             console.log(`✅ Artist profile: ${artistProfileUrl}`);
 
-            // 2. رفتن به صفحه آهنگ‌های محبوب
+            // 3. رفتن به صفحه آهنگ‌های محبوب
             const tracksPageUrl = artistProfileUrl + '/popular-tracks';
             await page.goto(tracksPageUrl, { waitUntil: 'networkidle2', timeout: 30000 });
             await sleep(4000);
 
-            // اسکرول
             for (let i = 0; i < 10; i++) {
               await page.evaluate(() => window.scrollBy(0, 800));
               await sleep(1500);
             }
 
-            // 3. استخراج آهنگ‌ها از صفحه
+            // 4. استخراج لینک‌ها از صفحه
             let tracks = await page.evaluate(() => {
               const items = document.querySelectorAll(
                 'li.soundList__item, article.audible, div.sound__body, li[class*="trackList__item"], div[class*="track"]'
@@ -169,19 +221,16 @@ jobs:
                 try {
                   const titleEl = item.querySelector('a[class*="soundTitle__title"], a[class*="title"], a[aria-label]');
                   const artistEl = item.querySelector('a[class*="soundTitle__username"], a[class*="owner"], span[class*="username"]');
-                  const imgEl = item.querySelector('img');
                   const href = titleEl ? titleEl.getAttribute('href') : '';
                   const title = titleEl ? titleEl.textContent.trim() : '';
                   const trackArtist = artistEl ? artistEl.textContent.trim() : '';
-                  const thumbnail = imgEl ? imgEl.getAttribute('src') : '';
                   if (title && href && href.startsWith('/') && href.split('/').filter(Boolean).length >= 2 && !href.includes('/you/') && !href.includes('/search/') && !href.includes('/feed') && !href.includes('/discover')) {
                     if (!seen.has(href)) {
                       seen.add(href);
                       results.push({
                         title,
                         artist: trackArtist,
-                        url: 'https://soundcloud.com' + href.split('?')[0],
-                        thumbnail: thumbnail.replace(/t\d+x\d+/, 't500x500')
+                        url: 'https://soundcloud.com' + href.split('?')[0]
                       });
                     }
                   }
@@ -190,28 +239,38 @@ jobs:
               return results;
             });
 
-            await browser.close();
-
-            if (tracks.length === 0) {
-              console.log('❌ No tracks found.');
-              const dir = `results/${artist}`;
-              fs.mkdirSync(dir, { recursive: true });
-              fs.writeFileSync(`${dir}/README.md`, `# ${artist}\n\n❌ No results found.`);
-              process.exit(0);
-            }
-
+            await page.close();
             console.log(`Found ${tracks.length} tracks. Fetching details...\n`);
 
-            // 4. دریافت اطلاعات کامل از API (تاریخ و کاور بهتر)
+            // 5. دریافت اطلاعات تکمیلی (تاریخ، کاور، مدت)
             const enrichedTracks = [];
             for (const t of tracks.slice(0, limit)) {
-              console.log(`   Enriching: ${t.title}`);
-              const enriched = await enrichTrack(t);
-              enrichedTracks.push(enriched);
-              await sleep(200); // تاخیر برای جلوگیری از rate limit
+              console.log(`   Processing: ${t.title}`);
+              // سعی با API (اگر clientId داریم)
+              let extra = null;
+              if (clientId) {
+                extra = await enrichViaApi(t, clientId);
+              }
+              // اگر API جواب نداد، مستقیماً به صفحه آهنگ مراجعه کن
+              if (!extra) {
+                extra = await enrichViaPage(browser, t.url);
+              }
+
+              // اعمال مقادیر
+              t.created_at = extra?.created_at || '';
+              t.thumbnail = extra?.artwork_url || '';
+              if (extra?.duration) {
+                const mins = Math.floor(extra.duration / 60000);
+                const secs = Math.floor((extra.duration % 60000) / 1000);
+                t.duration = `${mins}:${secs.toString().padStart(2,'0')}`;
+              }
+              enrichedTracks.push(t);
+              await sleep(300);
             }
 
-            // 5. ساختن share URL و فایل‌های خروجی
+            await browser.close();
+
+            // 6. آماده‌سازی نهایی و ذخیره
             const finalTracks = enrichedTracks.map((t, i) => ({
               ...t,
               shareUrl: t.url + '?si=' + randomSi() + '&utm_source=clipboard&utm_medium=text&utm_campaign=social_sharing',
@@ -223,7 +282,11 @@ jobs:
             const dir = `results/${artist}`;
             fs.mkdirSync(dir, { recursive: true });
 
-            // README.md
+            if (finalTracks.length === 0) {
+              fs.writeFileSync(`${dir}/README.md`, `# ${artist}\n\n❌ No results found.`);
+              process.exit(0);
+            }
+
             let md = `<div align="center">\n\n# 🎵 ${artist}\n\n**${finalTracks.length} tracks**\n\n</div>\n\n`;
             md += '<table>\n<tr><th>#</th><th>Cover</th><th>Track</th><th>Duration</th><th>Date</th><th>Share Link</th></tr>\n';
             let linksTxt = `# ${artist}\n\n`;
