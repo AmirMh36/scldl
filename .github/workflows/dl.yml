@@ -1,4 +1,4 @@
-name: 🎧 SoundCloud Private (cookies + curl)
+name: 🎧 SoundCloud Private (streamrip)
 
 on:
   workflow_dispatch:
@@ -20,87 +20,59 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install tools
+      - name: نصب ابزارها
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg jq curl
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg python3-pip
+          pip3 install streamrip
 
-      - name: Download private track
+      - name: استخراج توکن از کوکی‌ها و دانلود
         env:
           SC_URL: ${{ github.event.inputs.url }}
           SC_COOKIES: ${{ secrets.SC_COOKIES }}
         run: |
           mkdir -p "$OUTPUT_DIR"
           
-          # 1. بازسازی کوکی‌ها
+          # 1. بازیابی کوکی‌ها
           echo "$SC_COOKIES" > cookies.txt
           
-          # 2. استخراج client_id از صفحه اصلی
-          echo "🔑 Getting client_id..."
-          CLIENT_ID=$(curl -s https://soundcloud.com | grep -oP 'client_id:\s*"\K[^"]+' | head -1)
-          if [ -z "$CLIENT_ID" ]; then
-            CLIENT_ID="a3e059563d7fd3372b49b37f00a00bcf" # پشتیبان
-          fi
-          echo "Client ID: $CLIENT_ID"
-          
-          # 3. resolve کردن URL و دریافت اطلاعات آهنگ
-          echo "📡 Resolving track..."
-          RESOLVE_URL="https://api-v2.soundcloud.com/resolve?url=${SC_URL}&client_id=${CLIENT_ID}"
-          TRACK_INFO=$(curl -s -b cookies.txt "$RESOLVE_URL")
-          
-          TITLE=$(echo "$TRACK_INFO" | jq -r '.title // "unknown"')
-          ARTIST=$(echo "$TRACK_INFO" | jq -r '.user.username // "unknown"')
-          echo "🎵 $ARTIST - $TITLE"
-          
-          # 4. پیدا کردن progressive stream URL
-          STREAM_URL=$(echo "$TRACK_INFO" | jq -r '
-            .media.transcodings[] | 
-            select(.format.protocol == "progressive") | 
-            .url
-          ' | head -1)
-          
-          if [ -z "$STREAM_URL" ] || [ "$STREAM_URL" = "null" ]; then
-            # اگر progressive نبود، اولین گزینه موجود را بردار
-            STREAM_URL=$(echo "$TRACK_INFO" | jq -r '.media.transcodings[0].url // ""')
-          fi
-          
-          if [ -z "$STREAM_URL" ] || [ "$STREAM_URL" = "null" ]; then
-            echo "❌ No stream URL found"
+          # 2. استخراج oauth_token از فایل کوکی (خطی که شامل "oauth_token" است)
+          OAUTH_TOKEN=$(grep 'oauth_token' cookies.txt | awk '{print $NF}')
+          if [ -z "$OAUTH_TOKEN" ]; then
+            echo "❌ oauth_token در کوکی‌ها پیدا نشد"
             exit 1
           fi
+          echo "🔑 OAuth Token: ${OAUTH_TOKEN:0:10}..."
           
-          # 5. دریافت لینک مستقیم دانلود
-          echo "🔗 Getting direct download URL..."
-          STREAM_RESPONSE=$(curl -s -b cookies.txt "${STREAM_URL}?client_id=${CLIENT_ID}")
-          DOWNLOAD_URL=$(echo "$STREAM_RESPONSE" | jq -r '.url // ""')
+          # 3. تنظیم streamrip برای استفاده از این توکن
+          mkdir -p ~/.config/streamrip
+          cat > ~/.config/streamrip/config.toml << EOF
+          [soundcloud]
+          oauth_token = "$OAUTH_TOKEN"
+          quality = "high"
           
-          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
-            echo "❌ Could not extract download URL"
-            exit 1
-          fi
+          [downloads]
+          folder = "$OUTPUT_DIR"
+          EOF
           
-          # 6. دانلود با ffmpeg
-          SAFE_NAME=$(echo "${ARTIST} - ${TITLE}" | sed 's/[<>:"/\\|?*]/_/g' | cut -c1-100)
-          OUTPUT="${OUTPUT_DIR}/${SAFE_NAME}.mp3"
+          # 4. دانلود با streamrip
+          rip url "$SC_URL"
           
-          echo "⬇️ Downloading..."
-          ffmpeg -i "$DOWNLOAD_URL" \
-            -c:a libmp3lame -b:a 320k -ar 44100 \
-            -metadata title="$TITLE" \
-            -metadata artist="$ARTIST" \
-            -y "$OUTPUT" 2>&1 | tail -5
+          # 5. اگر فایل با فرمت mp3 نیست، تبدیل کن
+          cd "$OUTPUT_DIR"
+          for f in *.m4a *.ogg *.opus *.flac; do
+            [ -f "$f" ] || continue
+            echo "🔄 تبدیل $f به MP3..."
+            ffmpeg -i "$f" -c:a libmp3lame -b:a 320k -ar 44100 -y "${f%.*}.mp3"
+            rm "$f"
+          done
           
-          if [ -f "$OUTPUT" ]; then
-            SIZE=$(du -h "$OUTPUT" | cut -f1)
-            echo "✅ Saved: ${SAFE_NAME}.mp3 ($SIZE)"
-          else
-            echo "❌ Download failed"
-            exit 1
-          fi
+          echo "📁 فایل‌های نهایی:"
+          ls -lh *.mp3 2>/dev/null || echo "❌ هیچ فایل MP3 یافت نشد"
 
-      - name: Show files
+      - name: نمایش فایل‌ها
         run: ls -lh "$OUTPUT_DIR"
 
-      - name: Commit and push
+      - name: Commit و Push
         if: always()
         run: |
           find "$OUTPUT_DIR" -name "*.mp3" -size -10240c -delete
