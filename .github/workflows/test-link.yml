@@ -23,6 +23,10 @@ on:
         type: boolean
         default: false
 
+# رفع هشدار Node.js 20 (اختیاری)
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   search:
     runs-on: ubuntu-latest
@@ -30,10 +34,10 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v5  # ✅ Node.js 24
+      - uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6  # ✅ Node.js 24
+        uses: actions/setup-node@v6
         with:
           node-version: '24'
 
@@ -60,13 +64,12 @@ jobs:
             const artist = process.env.ARTIST.trim();
             const song = process.env.SONG.trim();
             const limit = parseInt(process.env.LIMIT) || 10;
-            const useProxy = process.env.USE_PROXY === 'true';
             const query = song ? `${artist} ${song}` : artist;
             
             console.log(`🎵 Search: "${query}"`);
             console.log(`Limit: ${limit}\n`);
 
-            const launchOpts = {
+            const browser = await puppeteer.launch({
               headless: 'new',
               args: [
                 '--no-sandbox',
@@ -74,9 +77,8 @@ jobs:
                 '--disable-dev-shm-usage',
                 '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
               ]
-            };
+            });
 
-            const browser = await puppeteer.launch(launchOpts);
             const page = await browser.newPage();
             await page.setViewport({ width: 1280, height: 900 });
 
@@ -87,35 +89,64 @@ jobs:
 
             try {
               await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 45000 });
-              console.log('Page loaded successfully.');
+              console.log('Page loaded.');
               await sleep(4000);
 
-              let initialCount = await page.$$eval('li.searchList__item', items => items.length);
-              console.log(`Tracks on first load: ${initialCount}`);
-
-              if (initialCount > 0 && initialCount < limit) {
-                for (let i = 0; i < 5; i++) {
-                  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-                  await sleep(2000);
-                  let count = await page.$$eval('li.searchList__item', items => items.length);
-                  console.log(`  Scroll ${i+1}: ${count} tracks`);
-                  if (count >= limit) break;
-                }
+              // تشخیص ساختار
+              const liCount = await page.$$eval('li', items => items.length);
+              console.log(`Total <li> elements: ${liCount}`);
+              if (liCount === 0) {
+                const htmlSample = await page.content();
+                console.log('Page HTML sample:', htmlSample.substring(0, 2000));
               }
 
+              // استخراج با انتخابگرهای چندگانه
               tracks = await page.evaluate(() => {
-                const items = document.querySelectorAll('li.searchList__item');
+                const selectors = [
+                  'li.searchList__item',
+                  'li.soundList__item',
+                  'article.audible',
+                  'div[class*="trackList"] > div',
+                  'li[class*="track"]',
+                  'div.sound__body',
+                  'tr.soundList__item',
+                  'li.searchResult__item',
+                  'div.searchResult__item',
+                ];
+
+                let items = [];
+                for (const sel of selectors) {
+                  items = document.querySelectorAll(sel);
+                  if (items.length > 0) break;
+                }
+
+                // روش دوم: پیمایش لینک‌های آهنگ
+                if (items.length === 0) {
+                  const allLinks = document.querySelectorAll('a[href^="/"][href*="/"]');
+                  const seen = new Set();
+                  allLinks.forEach(a => {
+                    const href = a.getAttribute('href');
+                    if (href && href.split('/').length >= 2 && !href.includes('search') && !href.includes('?')) {
+                      const parent = a.closest('li, article, div[class*="track"], div[class*="item"]');
+                      if (parent && !seen.has(href)) {
+                        seen.add(href);
+                        items = [...items, parent];
+                      }
+                    }
+                  });
+                }
+
                 const results = [];
                 items.forEach(item => {
                   try {
-                    const titleEl = item.querySelector('a[class*="soundTitle__title"]');
-                    const artistEl = item.querySelector('a[class*="soundTitle__username"]');
+                    const titleEl = item.querySelector('a[class*="title"], a[aria-label], a[href*="/"]');
+                    const artistEl = item.querySelector('a[class*="username"], span[class*="username"], a[class*="owner"]');
                     const imgEl = item.querySelector('img');
                     const title = titleEl ? titleEl.textContent.trim() : '';
                     const trackArtist = artistEl ? artistEl.textContent.trim() : '';
                     const href = titleEl ? titleEl.getAttribute('href') : '';
                     const thumbnail = imgEl ? imgEl.getAttribute('src') : '';
-                    if (title && href) {
+                    if (title && href && href.includes('/')) {
                       results.push({
                         title,
                         artist: trackArtist,
@@ -128,15 +159,23 @@ jobs:
                 return results;
               });
 
-              console.log(`Extracted ${tracks.length} tracks from page.`);
+              console.log(`Extracted ${tracks.length} tracks.`);
 
-            } catch (navErr) {
-              console.log(`Navigation failed: ${navErr.message}`);
+            } catch (err) {
+              console.log('Navigation error:', err.message);
             } finally {
               await browser.close();
             }
 
-            // Process and save results
+            if (tracks.length === 0) {
+              console.log('❌ No tracks found.');
+              const dir = `results/${artist}`;
+              fs.mkdirSync(dir, { recursive: true });
+              fs.writeFileSync(`${dir}/README.md`, `# ${artist}\n\n❌ No results found.`);
+              process.exit(0);
+            }
+
+            // ساخت لینک share و ذخیره‌سازی
             const finalTracks = tracks.slice(0, limit).map((t, i) => ({
               ...t,
               shareUrl: t.url + '?si=' + randomSi() + '&utm_source=clipboard&utm_medium=text&utm_campaign=social_sharing',
@@ -146,13 +185,6 @@ jobs:
             const dir = `results/${artist}`;
             fs.mkdirSync(dir, { recursive: true });
 
-            if (finalTracks.length === 0) {
-              fs.writeFileSync(`${dir}/README.md`, `# ${artist}\n\n❌ No results found.`);
-              fs.writeFileSync(`${dir}/links.txt`, 'No results');
-              process.exit(0);
-            }
-
-            // README with covers
             let md = `<div align="center">\n\n# 🎵 ${artist}\n\n**${finalTracks.length} tracks**\n\n</div>\n\n`;
             md += '<table>\n<tr><th>#</th><th>Cover</th><th>Track</th><th>Share Link</th></tr>\n';
             let linksTxt = `# ${artist}\n\n`;
