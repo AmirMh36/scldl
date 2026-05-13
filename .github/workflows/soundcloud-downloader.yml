@@ -38,90 +38,90 @@ jobs:
           SC_URL: ${{ github.event.inputs.url }}
           SC_AUTH_TOKEN: ${{ secrets.SC_AUTH_TOKEN }}
         run: |
-          mkdir -p $OUTPUT_DIR
-          cd $OUTPUT_DIR
+          mkdir -p "$OUTPUT_DIR"
           
-          echo "🎵 Downloading with yt-dlp..."
+          echo "🎵 Downloading from SoundCloud..."
           echo "URL: $SC_URL"
           echo ""
           
-          # Use OAuth token for authentication
-          # Try progressive MP3 first, fallback to HLS
+          # Download with yt-dlp
           yt-dlp \
             --extract-audio \
             --audio-format mp3 \
             --audio-quality 320k \
             --embed-metadata \
-            --embed-thumbnail \
             --add-header "Authorization:OAuth $SC_AUTH_TOKEN" \
             --no-playlist \
-            -o "%(uploader)s - %(title)s.%(ext)s" \
-            --verbose \
-            "$SC_URL" 2>&1 | tee /tmp/yt-dlp.log
+            -o "$OUTPUT_DIR/%(uploader)s - %(title)s.%(ext)s" \
+            "$SC_URL"
           
           echo ""
-          echo "📁 Downloaded files:"
-          ls -lh *.mp3 2>/dev/null || echo "No MP3 files yet"
+          echo "Download complete. Checking files..."
           
-          # Check if files are valid
-          for f in *.mp3; do
-            if [ -f "$f" ]; then
-              SIZE=$(stat -c%s "$f")
-              if [ "$SIZE" -gt 10000 ]; then
-                echo "✅ Valid: $f ($(echo "scale=1; $SIZE/1048576" | bc)MB)"
-              else
-                echo "⚠️ Invalid (too small): $f"
-                rm "$f"
-              fi
+          # List and validate files
+          find "$OUTPUT_DIR" -name "*.mp3" -type f | while read -r f; do
+            SIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            SIZE_MB=$((SIZE / 1048576))
+            if [ "$SIZE" -gt 10000 ]; then
+              echo "✅ $f (${SIZE_MB}MB)"
+            else
+              echo "⚠️ Removing invalid file: $f (${SIZE} bytes)"
+              rm -f "$f"
             fi
           done
 
-      - name: If yt-dlp failed, try with cookies
+      - name: Fallback - try without format restriction
         if: always()
         env:
           SC_URL: ${{ github.event.inputs.url }}
           SC_AUTH_TOKEN: ${{ secrets.SC_AUTH_TOKEN }}
         run: |
-          VALID_FILES=$(find $OUTPUT_DIR -name "*.mp3" -size +10k 2>/dev/null | wc -l)
+          # Check if any valid MP3 exists
+          VALID_COUNT=$(find "$OUTPUT_DIR" -name "*.mp3" -size +10k 2>/dev/null | wc -l)
           
-          if [ "$VALID_FILES" -eq 0 ]; then
-            echo "⚠️ First attempt failed, trying alternative method..."
+          if [ "$VALID_COUNT" -eq 0 ]; then
+            echo "No valid MP3 found. Trying fallback method..."
             
-            cd $OUTPUT_DIR
-            
-            # Try without forcing MP3 - get whatever format is available
+            # Download best available audio
             yt-dlp \
               --extract-audio \
               --audio-format best \
               --embed-metadata \
               --add-header "Authorization:OAuth $SC_AUTH_TOKEN" \
               --no-playlist \
-              -o "%(uploader)s - %(title)s.%(ext)s" \
-              "$SC_URL" 2>&1 || true
+              -o "$OUTPUT_DIR/%(uploader)s - %(title)s.%(ext)s" \
+              "$SC_URL" || echo "Fallback also failed"
             
-            echo ""
-            echo "📁 Files after fallback:"
-            ls -lh *.* 2>/dev/null
-            
-            # Convert any non-MP3 to MP3
-            for f in *.m4* *.ogg *.opus *.webm 2>/dev/null; do
-              if [ -f "$f" ]; then
-                BASENAME="${f%.*}"
-                echo "Converting $f to MP3..."
-                ffmpeg -i "$f" \
-                  -c:a libmp3lame \
-                  -b:a 320k \
-                  -ar 44100 \
-                  -y \
-                  "${BASENAME}.mp3" 2>/dev/null
-                
-                if [ -f "${BASENAME}.mp3" ]; then
-                  rm "$f"
-                  echo "✅ Converted: ${BASENAME}.mp3"
-                fi
+            # Convert any downloaded files to MP3
+            find "$OUTPUT_DIR" -type f ! -name "*.mp3" ! -name ".gitkeep" | while read -r f; do
+              BASENAME="${f%.*}"
+              echo "Converting: $f"
+              ffmpeg -i "$f" -c:a libmp3lame -b:a 320k -ar 44100 -y "${BASENAME}.mp3" 2>/dev/null
+              if [ -f "${BASENAME}.mp3" ]; then
+                rm -f "$f"
+                echo "✅ Created: ${BASENAME}.mp3"
               fi
             done
+          else
+            echo "✅ Already have $VALID_COUNT valid MP3 file(s)"
           fi
+
+      - name: Final file list
+        if: always()
+        run: |
+          echo ""
+          echo "📁 Final output:"
+          ls -lh "$OUTPUT_DIR/"*.mp3 2>/dev/null || echo "No MP3 files in output"
+          
+          # Create summary
+          cat > "$OUTPUT_DIR/summary.json" << EOF
+          {
+            "date": "$(date -Iseconds)",
+            "source": "${{ github.event.inputs.url }}",
+            "downloader": "yt-dlp",
+            "files": $(ls "$OUTPUT_DIR"/*.mp3 2>/dev/null | xargs -I{} basename {} | jq -R . | jq -s .)
+          }
+          EOF
 
       - name: Commit and push
         if: always()
@@ -130,17 +130,17 @@ jobs:
           git config --local user.name "github-actions[bot]"
           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT || github.token }}@github.com/${{ github.repository }}.git
           
-          # Remove invalid/small files
-          find $OUTPUT_DIR -name "*.mp3" -size -10k -delete 2>/dev/null || true
-          find $OUTPUT_DIR -name "*.part" -delete 2>/dev/null || true
-          find $OUTPUT_DIR -name "*.ytdl" -delete 2>/dev/null || true
+          # Remove any invalid files
+          find "$OUTPUT_DIR" -name "*.mp3" -size -10240c -delete 2>/dev/null || true
+          find "$OUTPUT_DIR" -name "*.part" -delete 2>/dev/null || true
+          find "$OUTPUT_DIR" -name "*.ytdl" -delete 2>/dev/null || true
           
-          git add $OUTPUT_DIR/
+          git add "$OUTPUT_DIR/"
           
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
             git commit -m "🎵 $(date +%Y-%m-%d_%H-%M-%S)"
             git push
-            echo "✅ Committed!"
+            echo "✅ Files committed to repository!"
           fi
