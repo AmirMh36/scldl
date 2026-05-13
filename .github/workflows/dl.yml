@@ -25,7 +25,7 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg python3-pip
           pip3 install streamrip
 
-      - name: استخراج توکن از کوکی‌ها و دانلود
+      - name: استخراج توکن و دانلود مستقیم
         env:
           SC_URL: ${{ github.event.inputs.url }}
           SC_COOKIES: ${{ secrets.SC_COOKIES }}
@@ -35,7 +35,7 @@ jobs:
           # 1. بازیابی کوکی‌ها
           echo "$SC_COOKIES" > cookies.txt
           
-          # 2. استخراج oauth_token از فایل کوکی (خطی که شامل "oauth_token" است)
+          # 2. استخراج oauth_token از فایل کوکی
           OAUTH_TOKEN=$(grep 'oauth_token' cookies.txt | awk '{print $NF}')
           if [ -z "$OAUTH_TOKEN" ]; then
             echo "❌ oauth_token در کوکی‌ها پیدا نشد"
@@ -43,27 +43,19 @@ jobs:
           fi
           echo "🔑 OAuth Token: ${OAUTH_TOKEN:0:10}..."
           
-          # 3. تنظیم streamrip برای استفاده از این توکن
-          mkdir -p ~/.config/streamrip
-          cat > ~/.config/streamrip/config.toml << EOF
-          [soundcloud]
-          oauth_token = "$OAUTH_TOKEN"
-          quality = "high"
+          # 3. دانلود با streamrip، توکن را مستقیماً پاس می‌دهیم
+          echo "⬇️ در حال دانلود آهنگ خصوصی..."
+          rip url \
+            --soundcloud-oauth-token "$OAUTH_TOKEN" \
+            -d "$OUTPUT_DIR" \
+            "$SC_URL"
           
-          [downloads]
-          folder = "$OUTPUT_DIR"
-          EOF
-          
-          # 4. دانلود با streamrip
-          rip url "$SC_URL"
-          
-          # 5. اگر فایل با فرمت mp3 نیست، تبدیل کن
+          # 4. تبدیل فایل‌های غیر mp3 (در صورت وجود)
           cd "$OUTPUT_DIR"
           for f in *.m4a *.ogg *.opus *.flac; do
             [ -f "$f" ] || continue
             echo "🔄 تبدیل $f به MP3..."
-            ffmpeg -i "$f" -c:a libmp3lame -b:a 320k -ar 44100 -y "${f%.*}.mp3"
-            rm "$f"
+            ffmpeg -i "$f" -c:a libmp3lame -b:a 320k -ar 44100 -y "${f%.*}.mp3" && rm "$f"
           done
           
           echo "📁 فایل‌های نهایی:"
