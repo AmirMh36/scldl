@@ -16,7 +16,7 @@ on:
         description: 'Max results'
         required: false
         type: string
-        default: '10'
+        default: '5'
 
 jobs:
   search:
@@ -27,141 +27,134 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup
-        run: |
-          sudo apt-get update -qq
-          pip3 install yt-dlp
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-      - name: Search
+      - name: Install Puppeteer
+        run: |
+          npm init -y
+          npm install puppeteer
+
+      - name: Search SoundCloud
         env:
           ARTIST: ${{ github.event.inputs.artist }}
           SONG: ${{ github.event.inputs.song }}
           LIMIT: ${{ github.event.inputs.limit }}
         run: |
-          mkdir -p "results"
-          
-          QUERY="${ARTIST} ${SONG}"
-          echo "Searching: ${QUERY}"
-          
-          yt-dlp \
-            --dump-json \
-            --no-download \
-            --default-search "scsearch" \
-            --max-downloads "${LIMIT}" \
-            "${QUERY}" > results/raw.json 2>/dev/null || true
-          
-          python3 << 'PYEOF'
-          import json, os
+          cat > search.js << 'SCRIPT'
+          const puppeteer = require('puppeteer');
+          const fs = require('fs');
 
-          artist = os.environ['ARTIST']
-          query = f"{artist} {os.environ.get('SONG', '')}".strip()
-          limit = int(os.environ.get('LIMIT', 10))
-          
-          os.makedirs(f"results/{artist}", exist_ok=True)
-          
-          tracks = []
-          if os.path.exists('results/raw.json'):
-              with open('results/raw.json') as f:
-                  for line in f:
-                      if line.startswith('{'):
-                          try:
-                              tracks.append(json.loads(line))
-                          except:
-                              pass
-
-          if not tracks:
-              with open(f"results/{artist}/README.md", 'w') as f:
-                  f.write(f"# {artist}\n\n❌ No results found.")
-              exit()
-
-          # Deduplicate
-          seen = set()
-          unique_tracks = []
-          for t in tracks:
-              url = t.get('webpage_url', '')
-              if url and url not in seen:
-                  seen.add(url)
-                  unique_tracks.append(t)
-          
-          tracks = unique_tracks[:limit]
-
-          # Build README
-          md = f"""<div align="center">
-
-          # 🎵 {artist}
-
-          **{len(tracks)} tracks found** | {query}
-
-          </div>
-
-          <table>
-          <tr><th>#</th><th>Cover</th><th>Track</th><th>Duration</th><th>Link</th></tr>
-          """
-
-          links_txt = f"# {artist} - SoundCloud Links\n\n"
-          json_data = []
-
-          for i, t in enumerate(tracks):
-              title = t.get('title', 'Unknown')
-              url = t.get('webpage_url', '')
-              thumb = t.get('thumbnail', '')
-              dur = t.get('duration', 0) or 0
-              mins = int(dur // 60)
-              secs = int(dur % 60)
-              duration = f"{mins}:{secs:02d}"
-              plays = t.get('view_count', 0) or 0
+          (async () => {
+            const artist = process.env.ARTIST;
+            const song = process.env.SONG;
+            const limit = parseInt(process.env.LIMIT) || 5;
+            const query = song ? `${artist} ${song}` : artist;
+            
+            console.log(`🔍 Searching SoundCloud for: "${query}"`);
+            
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: ['--no-sandbox', '--disable-setuid-sandbox']
+            });
+            
+            const page = await browser.newPage();
+            await page.setViewport({ width: 1280, height: 800 });
+            
+            // Go to SoundCloud search
+            const searchUrl = `https://soundcloud.com/search?q=${encodeURIComponent(query)}`;
+            console.log(`URL: ${searchUrl}`);
+            
+            await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+            
+            // Wait for results
+            await page.waitForTimeout(3000);
+            
+            // Extract tracks
+            const tracks = await page.evaluate(() => {
+              const results = [];
+              const items = document.querySelectorAll('li.searchList__item');
               
-              cover_html = f'<img src="{thumb}" width="60" height="60" style="border-radius:6px">' if thumb else '—'
+              items.forEach((item, i) => {
+                try {
+                  const link = item.querySelector('a.soundTitle__title');
+                  const artistEl = item.querySelector('a.soundTitle__username');
+                  const img = item.querySelector('img');
+                  const durationEl = item.querySelector('.sc-visuallyhidden');
+                  
+                  if (link && artistEl) {
+                    results.push({
+                      title: link.textContent.trim(),
+                      artist: artistEl.textContent.trim(),
+                      url: 'https://soundcloud.com' + link.getAttribute('href'),
+                      thumbnail: img ? img.getAttribute('src') : '',
+                      index: i + 1
+                    });
+                  }
+                } catch(e) {}
+              });
               
-              md += f"""
-          <tr>
-          <td>{i+1}</td>
-          <td>{cover_html}</td>
-          <td><strong>{title}</strong></td>
-          <td><code>{duration}</code></td>
-          <td><a href="{url}">🔗 Listen</a></td>
-          </tr>"""
+              return results.slice(0, 10);
+            });
+            
+            await browser.close();
+            
+            if (tracks.length === 0) {
+              console.log('❌ No tracks found');
+              fs.mkdirSync(`results/${artist}`, { recursive: true });
+              fs.writeFileSync(`results/${artist}/README.md`, `# ${artist}\n\n❌ No results found.`);
+              process.exit(0);
+            }
+            
+            console.log(`\n✅ Found ${tracks.length} tracks:\n`);
+            
+            // Save results
+            fs.mkdirSync(`results/${artist}`, { recursive: true });
+            
+            // README.md
+            let md = `<div align="center">\n\n# 🎵 ${artist}\n\n**${tracks.length} tracks found**\n\n</div>\n\n`;
+            md += '<table>\n<tr><th>#</th><th>Cover</th><th>Track</th><th>Link</th></tr>\n';
+            
+            let links_txt = `# ${artist} - SoundCloud Links\n\n`;
+            let json_data = [];
+            
+            tracks.forEach((t) => {
+              const cover = t.thumbnail ? `<img src="${t.thumbnail}" width="60" height="60" style="border-radius:6px">` : '—';
+              md += `<tr>\n<td>${t.index}</td>\n<td>${cover}</td>\n<td><strong>${t.artist} - ${t.title}</strong></td>\n<td><a href="${t.url}">🔗 Listen</a></td>\n</tr>\n`;
               
-              links_txt += f"{url}\n"
+              links_txt += `${t.url}\n`;
+              json_data.push(t);
               
-              json_data.append({
-                  'index': i+1,
-                  'title': title,
-                  'artist': t.get('uploader', artist),
-                  'url': url,
-                  'duration': duration,
-                  'thumbnail': thumb,
-                  'plays': plays
-              })
-              
-              print(f"{i+1}. {title} | {duration} | {url}")
-
-          md += "\n</table>\n"
-          md += f"\n---\n\n## 📋 Direct Links\n\n"
-          for j in json_data:
-              md += f"- [{j['title']}]({j['url']}) `{j['duration']}`\n"
-
-          # Save files
-          with open(f"results/{artist}/README.md", 'w', encoding='utf-8') as f:
-              f.write(md)
+              console.log(`${t.index}. ${t.artist} - ${t.title}`);
+              console.log(`   🔗 ${t.url}\n`);
+            });
+            
+            md += '</table>\n\n---\n\n## 📋 Direct Links\n\n';
+            json_data.forEach(t => {
+              md += `- [${t.artist} - ${t.title}](${t.url})\n`;
+            });
+            
+            fs.writeFileSync(`results/${artist}/README.md`, md);
+            fs.writeFileSync(`results/${artist}/links.txt`, links_txt);
+            fs.writeFileSync(`results/${artist}/links.json`, JSON.stringify({
+              artist, query, total: tracks.length,
+              date: new Date().toISOString(),
+              tracks: json_data
+            }, null, 2));
+            
+            console.log(`✅ Saved to results/${artist}/`);
+          })();
+          SCRIPT
           
-          with open(f"results/{artist}/links.txt", 'w') as f:
-              f.write(links_txt)
-          
-          with open(f"results/{artist}/links.json", 'w') as f:
-              json.dump({
-                  'artist': artist,
-                  'query': query,
-                  'total': len(tracks),
-                  'tracks': json_data
-              }, f, indent=2)
+          node search.js
 
-          print(f"\n✅ Saved to results/{artist}/")
-          PYEOF
-
-      - name: Show
+      - name: Show results
         run: |
-          cat results/${{ github.event.inputs.artist }}/links.txt 2>/dev/null || echo "No results"
+          cat results/$ARTIST/links.txt 2>/dev/null || echo "No results"
+        env:
+          ARTIST: ${{ github.event.inputs.artist }}
 
       - name: Commit
         run: |
