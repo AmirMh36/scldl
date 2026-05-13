@@ -1,0 +1,283 @@
+name: SoundCloud Search 2
+
+on:
+  workflow_dispatch:
+    inputs:
+      artist:
+        description: 'Artist name'
+        required: true
+        type: string
+      song:
+        description: 'Song name (optional)'
+        required: false
+        type: string
+        default: ''
+      limit:
+        description: 'Max results (1-50)'
+        required: false
+        type: string
+        default: '10'
+      use_proxy:
+        description: 'Use free proxy?'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install Puppeteer
+        run: |
+          npm init -y
+          npm install puppeteer
+
+      - name: Search SoundCloud
+        env:
+          ARTIST: ${{ github.event.inputs.artist }}
+          SONG: ${{ github.event.inputs.song }}
+          LIMIT: ${{ github.event.inputs.limit }}
+          USE_PROXY: ${{ github.event.inputs.use_proxy }}
+        run: |
+          cat > search.js << 'SCRIPT'
+          const puppeteer = require('puppeteer');
+          const https = require('https');
+          const fs = require('fs');
+
+          const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+          const randomSi = () => Array.from({length: 32}, () => Math.floor(Math.random() * 16).toString(16)).join('');
+
+          function apiRequest(url) {
+            return new Promise((resolve, reject) => {
+              https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                  try { resolve(JSON.parse(data)); }
+                  catch(e) { resolve(null); }
+                });
+              }).on('error', reject);
+            });
+          }
+
+          async function enrichTrack(track) {
+            try {
+              const resolveUrl = `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(track.url)}&client_id=a3e059563d7fd3372b49b37f00a00bcf`;
+              const data = await apiRequest(resolveUrl);
+              if (data && data.created_at) {
+                track.created_at = data.created_at;
+              }
+              if (data && data.artwork_url) {
+                track.thumbnail = data.artwork_url.replace('large', 't500x500');
+              }
+              if (data && data.duration) {
+                track.duration_ms = data.duration;
+                const mins = Math.floor(data.duration / 60000);
+                const secs = Math.floor((data.duration % 60000) / 1000);
+                track.duration = `${mins}:${secs.toString().padStart(2,'0')}`;
+              }
+            } catch(e) {}
+            return track;
+          }
+
+          (async () => {
+            const artist = process.env.ARTIST.trim();
+            const song = process.env.SONG.trim();
+            const limit = parseInt(process.env.LIMIT) || 10;
+            const query = song ? `${artist} ${song}` : artist;
+            
+            console.log(`🎵 Searching: "${query}"\n`);
+
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+              ]
+            });
+            const page = await browser.newPage();
+            await page.setViewport({ width: 1280, height: 900 });
+
+            // 1. پیدا کردن پروفایل هنرمند
+            const peopleSearchUrl = `https://soundcloud.com/search/people?q=${encodeURIComponent(artist)}`;
+            await page.goto(peopleSearchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+            await sleep(3000);
+
+            const profileLinks = await page.evaluate(() => {
+              const links = document.querySelectorAll('a[href^="/"]');
+              const results = [];
+              for (const a of links) {
+                const href = a.getAttribute('href');
+                if (href && href.split('/').filter(Boolean).length === 1 && !href.includes('search')) {
+                  results.push({ url: 'https://soundcloud.com' + href, name: a.textContent.trim() });
+                }
+              }
+              return results;
+            });
+
+            let artistProfileUrl = null;
+            for (const link of profileLinks) {
+              if (link.name.toLowerCase() === artist.toLowerCase()) {
+                artistProfileUrl = link.url;
+                break;
+              }
+            }
+            if (!artistProfileUrl && profileLinks.length > 0) {
+              artistProfileUrl = profileLinks[0].url;
+            }
+            if (!artistProfileUrl) {
+              console.log('❌ Artist profile not found.');
+              await browser.close();
+              process.exit(0);
+            }
+            console.log(`✅ Artist profile: ${artistProfileUrl}`);
+
+            // 2. رفتن به صفحه آهنگ‌های محبوب
+            const tracksPageUrl = artistProfileUrl + '/popular-tracks';
+            await page.goto(tracksPageUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+            await sleep(4000);
+
+            // اسکرول
+            for (let i = 0; i < 10; i++) {
+              await page.evaluate(() => window.scrollBy(0, 800));
+              await sleep(1500);
+            }
+
+            // 3. استخراج آهنگ‌ها از صفحه
+            let tracks = await page.evaluate(() => {
+              const items = document.querySelectorAll(
+                'li.soundList__item, article.audible, div.sound__body, li[class*="trackList__item"], div[class*="track"]'
+              );
+              const results = [];
+              const seen = new Set();
+              items.forEach(item => {
+                try {
+                  const titleEl = item.querySelector('a[class*="soundTitle__title"], a[class*="title"], a[aria-label]');
+                  const artistEl = item.querySelector('a[class*="soundTitle__username"], a[class*="owner"], span[class*="username"]');
+                  const imgEl = item.querySelector('img');
+                  const href = titleEl ? titleEl.getAttribute('href') : '';
+                  const title = titleEl ? titleEl.textContent.trim() : '';
+                  const trackArtist = artistEl ? artistEl.textContent.trim() : '';
+                  const thumbnail = imgEl ? imgEl.getAttribute('src') : '';
+                  if (title && href && href.startsWith('/') && href.split('/').filter(Boolean).length >= 2 && !href.includes('/you/') && !href.includes('/search/') && !href.includes('/feed') && !href.includes('/discover')) {
+                    if (!seen.has(href)) {
+                      seen.add(href);
+                      results.push({
+                        title,
+                        artist: trackArtist,
+                        url: 'https://soundcloud.com' + href.split('?')[0],
+                        thumbnail: thumbnail.replace(/t\d+x\d+/, 't500x500')
+                      });
+                    }
+                  }
+                } catch(e) {}
+              });
+              return results;
+            });
+
+            await browser.close();
+
+            if (tracks.length === 0) {
+              console.log('❌ No tracks found.');
+              const dir = `results/${artist}`;
+              fs.mkdirSync(dir, { recursive: true });
+              fs.writeFileSync(`${dir}/README.md`, `# ${artist}\n\n❌ No results found.`);
+              process.exit(0);
+            }
+
+            console.log(`Found ${tracks.length} tracks. Fetching details...\n`);
+
+            // 4. دریافت اطلاعات کامل از API (تاریخ و کاور بهتر)
+            const enrichedTracks = [];
+            for (const t of tracks.slice(0, limit)) {
+              console.log(`   Enriching: ${t.title}`);
+              const enriched = await enrichTrack(t);
+              enrichedTracks.push(enriched);
+              await sleep(200); // تاخیر برای جلوگیری از rate limit
+            }
+
+            // 5. ساختن share URL و فایل‌های خروجی
+            const finalTracks = enrichedTracks.map((t, i) => ({
+              ...t,
+              shareUrl: t.url + '?si=' + randomSi() + '&utm_source=clipboard&utm_medium=text&utm_campaign=social_sharing',
+              index: i + 1,
+              date: t.created_at ? new Date(t.created_at).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : '—',
+              duration: t.duration || '—'
+            }));
+
+            const dir = `results/${artist}`;
+            fs.mkdirSync(dir, { recursive: true });
+
+            // README.md
+            let md = `<div align="center">\n\n# 🎵 ${artist}\n\n**${finalTracks.length} tracks**\n\n</div>\n\n`;
+            md += '<table>\n<tr><th>#</th><th>Cover</th><th>Track</th><th>Duration</th><th>Date</th><th>Share Link</th></tr>\n';
+            let linksTxt = `# ${artist}\n\n`;
+            let jsonTracks = [];
+
+            finalTracks.forEach(t => {
+              const cover = t.thumbnail ? `<img src="${t.thumbnail}" width="80" height="80" style="border-radius:8px">` : '🎵';
+              md += `<tr>`;
+              md += `<td align="center">${t.index}</td>`;
+              md += `<td align="center">${cover}</td>`;
+              md += `<td><strong>${t.artist || artist} — ${t.title}</strong></td>`;
+              md += `<td align="center"><code>${t.duration}</code></td>`;
+              md += `<td align="center">${t.date}</td>`;
+              md += `<td align="center"><a href="${t.shareUrl}" target="_blank">🔗 Share</a></td>`;
+              md += `</tr>\n`;
+              
+              linksTxt += `${t.shareUrl}\n`;
+              jsonTracks.push({
+                index: t.index,
+                artist: t.artist || artist,
+                title: t.title,
+                url: t.url,
+                shareUrl: t.shareUrl,
+                duration: t.duration,
+                date: t.date,
+                thumbnail: t.thumbnail
+              });
+              console.log(`${t.index}. ${t.artist || artist} — ${t.title}  [${t.duration}]  ${t.date}`);
+              console.log(`   🔗 ${t.shareUrl}\n`);
+            });
+
+            md += '</table>\n\n---\n\n## 📋 Share Links\n\n';
+            finalTracks.forEach(t => {
+              md += `- **${t.index}.** [${t.artist || artist} — ${t.title}](${t.shareUrl}) \`${t.duration}\` — ${t.date}\n`;
+            });
+
+            fs.writeFileSync(`${dir}/README.md`, md);
+            fs.writeFileSync(`${dir}/links.txt`, linksTxt);
+            fs.writeFileSync(`${dir}/links.json`, JSON.stringify({ artist, query, total: finalTracks.length, tracks: jsonTracks }, null, 2));
+            console.log(`✅ Saved ${finalTracks.length} tracks to ${dir}/`);
+          })();
+          SCRIPT
+          
+          node search.js
+
+      - name: Show results
+        run: |
+          ARTIST="${{ github.event.inputs.artist }}"
+          cat "results/$ARTIST/links.txt" 2>/dev/null || echo "No results"
+
+      - name: Commit
+        if: always()
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add results/
+          git diff --staged --quiet || git commit -m "🔍 ${{ github.event.inputs.artist }}" && git push
