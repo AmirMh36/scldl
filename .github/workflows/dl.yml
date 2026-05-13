@@ -1,10 +1,11 @@
-name: 🎧 SoundCloud Private (multidl + FFmpeg)
+# .github/workflows/soundcloud-private-puppeteer-stream.yml
+name: SoundCloud Private (Puppeteer + Curl)
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'SoundCloud private track URL'
+        description: 'لینک آهنگ خصوصی'
         required: true
         type: string
 
@@ -20,79 +21,161 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Setup Node.js و FFmpeg
+      - name: Setup Node.js & FFmpeg
         uses: actions/setup-node@v6
         with:
           node-version: '24'
 
-      - name: نصب ابزارها
+      - name: Install Puppeteer & tools
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-          npm install -g multidl-cli
-          echo "✅ multidl-cli نصب شد"
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg curl jq
+          npm init -y
+          npm install puppeteer
 
-      - name: استخراج توکن و دانلود
+      - name: Extract Token, Run Puppeteer & Download
         env:
           SC_URL: ${{ github.event.inputs.url }}
           SC_COOKIES: ${{ secrets.SC_COOKIES }}
         run: |
           mkdir -p "$OUTPUT_DIR"
-          
-          # استخراج توکن از کوکی‌ها
           echo "$SC_COOKIES" > cookies.txt
-          OAUTH_TOKEN=$(grep 'oauth_token' cookies.txt | awk '{print $NF}')
           
-          if [ -z "$OAUTH_TOKEN" ]; then
-            echo "❌ توکن پیدا نشد"
+          cat > get_stream.js << 'SCRIPT'
+          const puppeteer = require('puppeteer');
+          const fs = require('fs');
+
+          (async () => {
+            const url = process.env.SC_URL;
+            const cookiesText = fs.readFileSync('cookies.txt', 'utf8');
+            
+            // Parse cookies
+            const cookies = cookiesText
+              .split('\n')
+              .filter(line => line && !line.startsWith('#'))
+              .map(line => {
+                const p = line.split('\t');
+                if (p.length >= 7) return {
+                  name: p[5].trim(), value: p[6].trim(),
+                  domain: p[0].trim().replace(/^\./, ''),
+                  path: p[2].trim(), httpOnly: p[3].trim() === 'TRUE',
+                  secure: p[1].trim() === 'TRUE',
+                  expires: parseInt(p[4]) || undefined
+                };
+              }).filter(c => c && c.name);
+            
+            console.log(`Cookies loaded: ${cookies.length}`);
+
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--autoplay-policy=no-user-gesture-required']
+            });
+            const page = await browser.newPage();
+            await page.setCookie(...cookies);
+            
+            // Intercept network requests to capture audio stream
+            let streamUrl = null;
+            let streamHeaders = null;
+            await page.setRequestInterception(true);
+            page.on('request', req => {
+              const u = req.url();
+              // انواع لینک‌های صوتی: progressive mp3, m4a, HLS m3u8, init.mp4
+              if (u.includes('.mp3') || u.includes('/media/') || u.includes('/stream/') || u.includes('.m3u8') || u.includes('/cenc/')) {
+                console.log('🎯 Found stream:', u.substring(0, 150));
+                streamUrl = u;
+                streamHeaders = req.headers();
+                req.abort(); // stop loading in browser
+              } else {
+                req.continue();
+              }
+            });
+
+            console.log('Opening track page...');
+            await page.goto(url, { waitUntil: 'networkidle2', timeout: 40000 });
+            
+            // Get metadata
+            const metadata = await page.evaluate(() => ({
+              title: document.querySelector('meta[property="og:title"]')?.content || 'Unknown',
+              artist: document.querySelector('meta[property="soundcloud:author"]')?.content || 'Unknown'
+            }));
+            console.log(`Track: ${metadata.artist} - ${metadata.title}`);
+
+            // Click Play button safely
+            const clicked = await page.evaluate(() => {
+              const btn = document.querySelector('button.playControl') ||
+                          document.querySelector('.playControl') ||
+                          document.querySelector('[class*="playControl"]');
+              if (btn) { btn.click(); return true; }
+              return false;
+            });
+            console.log(`Play clicked: ${clicked}`);
+
+            // Wait for stream to be intercepted
+            await new Promise(r => setTimeout(r, 6000));
+
+            await browser.close();
+
+            if (!streamUrl) {
+              console.error('No stream URL captured.');
+              process.exit(1);
+            }
+
+            // Save URL and essential headers for curl
+            const info = {
+              url: streamUrl,
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+                'Referer': 'https://soundcloud.com/',
+                'Origin': 'https://soundcloud.com',
+                'Accept': '*/*'
+              },
+              metadata
+            };
+            fs.writeFileSync('stream_info.json', JSON.stringify(info, null, 2));
+            console.log('Stream info saved to stream_info.json');
+          })();
+          SCRIPT
+          
+          node get_stream.js
+
+          # حالا stream_info.json را بخوان و دانلود کن
+          if [ ! -f stream_info.json ]; then
+            echo "❌ stream_info.json not created"
             exit 1
           fi
-          
-          echo "🔑 توکن: ${OAUTH_TOKEN:0:15}..."
-          
-          cd "$OUTPUT_DIR"
-          
-          # دانلود با multidl (توکن را با echo پاس می‌دهیم)
-          echo "$OAUTH_TOKEN" | multidl \
-            "$SC_URL" \
-            --download-dir . \
-            --quality high 2>&1
-          
-          echo "📁 فایل‌های دانلود شده:"
-          ls -lh
-          
-          # تبدیل M4A به MP3
-          for f in *.m4a *.ogg *.opus *.aac 2>/dev/null; do
-            if [ -f "$f" ] && [ $(stat -c%s "$f") -gt 10240 ]; then
-              BASENAME="${f%.*}"
-              echo "🔄 تبدیل $f به MP3..."
-              ffmpeg -i "$f" \
-                -c:a libmp3lame \
-                -b:a 320k \
-                -ar 44100 \
-                -metadata title="${BASENAME}" \
-                -y \
-                "${BASENAME}.mp3" 2>/dev/null
-              
-              if [ -f "${BASENAME}.mp3" ] && [ $(stat -c%s "${BASENAME}.mp3") -gt 10240 ]; then
-                rm "$f"
-                echo "✅ ${BASENAME}.mp3 ($(du -h "${BASENAME}.mp3" | cut -f1))"
-              fi
-            fi
-          done
-          
-          echo "📁 فایل‌های نهایی MP3:"
-          ls -lh *.mp3 2>/dev/null || echo "❌ هیچ فایل MP3 نهایی نشد"
 
-      - name: نمایش فایل‌ها
-        run: ls -lh "$OUTPUT_DIR"
+          STREAM_URL=$(jq -r '.url' stream_info.json)
+          TITLE=$(jq -r '.metadata.title' stream_info.json)
+          ARTIST=$(jq -r '.metadata.artist' stream_info.json)
+          
+          echo "📥 Downloading stream: ${STREAM_URL:0:100}..."
+          SAFE_NAME=$(echo "${ARTIST} - ${TITLE}" | sed 's/[<>:"/\\|?*]/_/g' | cut -c1-100)
+          
+          # دانلود با curl و ارسال هدرهای ضروری
+          curl -L -o "$OUTPUT_DIR/temp_audio" \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+            -H "Referer: https://soundcloud.com/" \
+            -H "Origin: https://soundcloud.com" \
+            -b cookies.txt \
+            "$STREAM_URL"
 
-      - name: Commit و Push
+          if [ -f "$OUTPUT_DIR/temp_audio" ] && [ $(stat -c%s "$OUTPUT_DIR/temp_audio") -gt 10240 ]; then
+            # تبدیل به MP3 با ffmpeg
+            ffmpeg -i "$OUTPUT_DIR/temp_audio" \
+              -c:a libmp3lame -b:a 320k -ar 44100 \
+              -metadata title="$TITLE" -metadata artist="$ARTIST" \
+              -y "$OUTPUT_DIR/${SAFE_NAME}.mp3"
+            rm "$OUTPUT_DIR/temp_audio"
+            echo "✅ دانلود کامل: ${SAFE_NAME}.mp3"
+          else
+            echo "❌ دانلود ناموفق یا فایل خیلی کوچک"
+            exit 1
+          fi
+
+      - name: Commit & Push
         if: always()
         run: |
-          # حذف فایل‌های غیر MP3
-          find "$OUTPUT_DIR" -type f ! -name "*.mp3" -delete 2>/dev/null || true
-          find "$OUTPUT_DIR" -name "*.mp3" -size -10240c -delete 2>/dev/null || true
-          
+          find "$OUTPUT_DIR" -type f ! -name "*.mp3" -delete
+          find "$OUTPUT_DIR" -name "*.mp3" -size -10240c -delete
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
           git add "$OUTPUT_DIR/"
