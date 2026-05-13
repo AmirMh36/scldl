@@ -9,9 +9,6 @@ on:
         required: true
         type: string
 
-env:
-  OUTPUT_DIR: music-downloads
-
 jobs:
   download:
     runs-on: ubuntu-latest
@@ -25,142 +22,50 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Setup
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install multidl-cli
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
-          python3 -m pip install yt-dlp
-          echo "✅ Ready"
+          npm install -g multidl-cli
+          echo "✅ multidl-cli $(multidl --version 2>/dev/null || echo 'installed')"
 
       - name: Download from SoundCloud
         env:
           SC_URL: ${{ github.event.inputs.url }}
+          SC_OAUTH_TOKEN: ${{ secrets.SC_AUTH_TOKEN }}
         run: |
-          mkdir -p "$OUTPUT_DIR"
+          mkdir -p music-downloads
+          cd music-downloads
           
-          echo "🎵 SoundCloud Download"
+          echo "🎵 Downloading from SoundCloud..."
           echo "URL: $SC_URL"
           echo ""
           
-          cd "$OUTPUT_DIR"
-          
-          # Try all formats
-          python3 -m yt_dlp \
-            -f "bestaudio/best" \
-            --extract-audio \
-            --audio-format mp3 \
-            --audio-quality 0 \
-            --embed-metadata \
-            --no-playlist \
-            --no-check-certificate \
-            --prefer-ffmpeg \
-            -o "%(uploader)s - %(title)s.%(ext)s" \
-            "$SC_URL" 2>&1
+          multidl \
+            "$SC_URL" \
+            --download-dir . \
+            --oauth-token "$SC_OAUTH_TOKEN" \
+            --quality high 2>&1
           
           echo ""
-          echo "Files:"
-          ls -lh *.mp3 2>/dev/null || echo "No MP3 files"
-
-      - name: Fallback with cookies
-        if: always()
-        env:
-          SC_URL: ${{ github.event.inputs.url }}
-        run: |
-          cd "$OUTPUT_DIR"
-          
-          # Check if we got valid files
-          VALID=0
-          for f in *.mp3; do
-            [ -f "$f" ] && [ $(stat -c%s "$f") -gt 10000 ] && VALID=1
-          done
-          
-          if [ "$VALID" -eq 0 ]; then
-            echo "First try failed. Trying alternative..."
-            rm -f *.mp3
-            
-            # Try with different options
-            python3 -m yt_dlp \
-              --extract-audio \
-              --audio-format mp3 \
-              --prefer-ffmpeg \
-              --ffmpeg-location /usr/bin/ffmpeg \
-              --no-playlist \
-              --ignore-errors \
-              -o "%(title)s.%(ext)s" \
-              "$SC_URL" 2>&1
-            
-            echo ""
-            echo "Files after fallback:"
-            ls -lh *.* 2>/dev/null
-          fi
-
-      - name: Final attempt with scdl
-        if: always()
-        env:
-          SC_URL: ${{ github.event.inputs.url }}
-        run: |
-          cd "$OUTPUT_DIR"
-          
-          # Final check
-          HAS_MP3=$(find . -name "*.mp3" -size +10k 2>/dev/null | wc -l)
-          
-          if [ "$HAS_MP3" -eq 0 ]; then
-            echo "Previous methods failed. Last attempt with scdl..."
-            
-            pip3 install scdl 2>/dev/null
-            
-            scdl \
-              -l "$SC_URL" \
-              --onlymp3 \
-              --name-format="{title}" \
-              --no-original 2>&1 || echo "scdl also failed"
-            
-            # Check again
-            find . -type f -name "*.mp3" -size +10k | while read f; do
-              echo "✅ Got: $f ($(du -h "$f" | cut -f1))"
-            done
-          fi
-
-      - name: Convert any remaining audio files
-        if: always()
-        run: |
-          cd "$OUTPUT_DIR"
-          
-          # Convert non-MP3 files if any
-          for f in *.m4a *.ogg *.opus *.aac *.wav *.flac 2>/dev/null; do
-            if [ -f "$f" ] && [ $(stat -c%s "$f") -gt 10000 ]; then
-              NAME="${f%.*}"
-              echo "Converting: $f"
-              ffmpeg -nostdin -i "$f" -c:a libmp3lame -b:a 320k "${NAME}.mp3" -y 2>/dev/null && rm "$f"
-            fi
-          done
-          
-          # Show final results
-          echo "📁 Final files:"
-          for f in *.mp3; do
-            [ -f "$f" ] && echo "  ✅ $f ($(du -h "$f" | cut -f1))"
-          done
+          echo "📁 Downloaded files:"
+          ls -lh *.{mp3,m4a,flac,wav} 2>/dev/null || ls -lh
 
       - name: Commit and push
-        if: always()
         run: |
-          cd "$OUTPUT_DIR"
-          # Remove invalid files
-          find . -type f -name "*.mp3" -size -10240c -delete
-          find . -type f -name "*.part" -delete
-          find . -type f -name "*.ytdl" -delete
-          cd ..
-          
-          git config --local user.email "actions@github.com"
-          git config --local user.name "GitHub Actions"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT || github.token }}@github.com/${{ github.repository }}.git
           
-          git add "$OUTPUT_DIR/"
+          git add music-downloads/
           
           if git diff --staged --quiet; then
-            echo "No new files"
+            echo "No changes to commit"
           else
             git commit -m "🎵 $(date +%Y-%m-%d_%H-%M-%S)"
             git push
-            echo "✅ Committed"
+            echo "✅ Done!"
           fi
