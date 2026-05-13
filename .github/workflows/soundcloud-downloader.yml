@@ -22,28 +22,21 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Install orpheusdl and soundcloud plugin
+      - name: Setup Node.js and FFmpeg
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install FFmpeg
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg python3-pip
-          
-          pip3 install orpheusdl
-          pip3 install orpheusdl-soundcloud
-          
-          echo "✅ orpheusdl installed"
+          sudo apt-get install -y -qq ffmpeg
+          echo "✅ FFmpeg ready"
 
-      - name: Configure orpheusdl
+      - name: Install soundcloud-dl
         run: |
-          mkdir -p ~/.config/orpheusdl
-          cat > ~/.config/orpheusdl/config.json << EOF
-          {
-            "soundcloud": {
-              "client_id": "a3e059563d7fd3372b49b37f00a00bcf",
-              "app_version": "1621419210"
-            }
-          }
-          EOF
-          echo "✅ Configured"
+          npm install -g soundcloud-downloader-cli
+          echo "✅ Installed"
 
       - name: Download from SoundCloud
         env:
@@ -52,42 +45,40 @@ jobs:
           mkdir -p music-downloads
           cd music-downloads
           
-          echo "🎵 Downloading with orpheusdl..."
+          echo "🎵 Downloading with soundcloud-downloader-cli..."
           echo "URL: $SC_URL"
           echo ""
           
-          orpheusdl "$SC_URL" 2>&1
+          sc-dl "$SC_URL" 2>&1
           
           echo ""
           echo "📁 Downloaded files:"
-          ls -lhR
+          ls -lh
 
-      - name: Convert to MP3 if needed
+      - name: Convert to MP3
         run: |
           cd music-downloads
           
-          # Find audio files and convert
-          find . -type f \( -name "*.flac" -o -name "*.m4a" -o -name "*.ogg" -o -name "*.opus" \) | while read f; do
-            SIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
-            if [ "$SIZE" -gt 10240 ]; then
+          # Convert any audio file to MP3
+          for f in *.m4a *.ogg *.opus *.flac *.wav *.aac *.webm 2>/dev/null; do
+            if [ -f "$f" ] && [ $(stat -c%s "$f" 2>/dev/null || echo 0) -gt 10240 ]; then
               NAME="${f%.*}"
-              echo "🔄 Converting: $f"
-              ffmpeg -nostdin -i "$f" -c:a libmp3lame -b:a 320k -ar 44100 -y "${NAME}.mp3" 2>/dev/null && rm "$f"
+              echo "🔄 Converting: $f → ${NAME}.mp3"
+              ffmpeg -nostdin -i "$f" -c:a libmp3lame -b:a 320k -ar 44100 -y "${NAME}.mp3" 2>/dev/null
+              if [ -f "${NAME}.mp3" ]; then
+                rm "$f"
+                echo "  ✅ ${NAME}.mp3 ($(du -h "${NAME}.mp3" | cut -f1))"
+              fi
             fi
           done
           
           echo ""
           echo "📁 Final MP3 files:"
-          find . -name "*.mp3" -type f | while read f; do
-            echo "  ✅ $f ($(du -h "$f" | cut -f1))"
-          done
+          ls -lh *.mp3 2>/dev/null || echo "No MP3 files"
 
       - name: Commit and push
-        if: always()
         run: |
-          # Clean up
           find music-downloads -type f ! -name "*.mp3" -delete 2>/dev/null || true
-          find music-downloads -type f -name "*.mp3" -size -10240c -delete 2>/dev/null || true
           
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
