@@ -1,11 +1,10 @@
-# .github/workflows/spotify-search-ytdlp.yml
-name: 🎧 Spotify Search (No Auth - yt-dlp)
+name: 🎧 Spotify Search (Guest Token)
 
 on:
   workflow_dispatch:
     inputs:
       artist:
-        description: 'Artist name (e.g., The Weeknd)'
+        description: 'Artist name'
         required: true
         type: string
       song:
@@ -19,9 +18,6 @@ on:
         type: string
         default: '10'
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   search:
     runs-on: ubuntu-latest
@@ -31,101 +27,111 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install yt-dlp & jq
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq jq
-          python3 -m pip install -U yt-dlp
-
-      - name: Search Spotify & Extract Links
+      - name: Search Spotify & Generate Results
         env:
           ARTIST: ${{ github.event.inputs.artist }}
           SONG: ${{ github.event.inputs.song }}
           LIMIT: ${{ github.event.inputs.limit }}
         run: |
           mkdir -p "results/$ARTIST"
-          QUERY="$ARTIST $SONG"
-          
-          echo "🎵 Searching Spotify: \"$QUERY\""
-          
-          # جستجو با yt-dlp (خروجی JSON)
-          yt-dlp \
-            --flat-playlist \
-            --dump-json \
-            --no-download \
-            --default-search "spotify" \
-            --max-downloads "$LIMIT" \
-            "$QUERY" > "results/$ARTIST/raw.json" 2>/dev/null
-          
-          # تبدیل خروجی به فرمت‌های دلخواه
           python3 << 'PYEOF'
-          import json, os, re
-          
-          artist = os.environ['ARTIST']
+          import os, json, re, urllib.request, urllib.parse
+
+          artist = os.environ['ARTIST'].strip()
+          song = os.environ.get('SONG', '').strip()
           limit = int(os.environ.get('LIMIT', 10))
-          query = f"{artist} {os.environ.get('SONG', '')}".strip()
-          dir = f"results/{artist}"
+          query = f"{artist} {song}" if song else artist
+
+          print(f"🎵 Spotify Search: \"{query}\"")
+
+          # 1. دریافت توکن مهمان (guest)
+          opener = urllib.request.build_opener()
+          opener.addheaders = [('User-Agent', 'Mozilla/5.0 (X11; Linux x86_64)')]
+          with opener.open('https://open.spotify.com') as resp:
+              html = resp.read().decode()
+          # استخراج accessToken از اسکریپت‌های صفحه
+          tokens = re.findall(r'accessToken":"(eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)"', html)
+          if not tokens:
+              tokens = re.findall(r'accessToken%22%3A%22(eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)%22', html)
+          if not tokens:
+              # روش دوم: استفاده از /get_access_token?reason=transport
+              try:
+                  with opener.open('https://open.spotify.com/get_access_token?reason=transport&productType=web_player') as resp2:
+                      token_data = json.load(resp2)
+                      tokens = [token_data.get('accessToken','')]
+              except: pass
+          if not tokens:
+              print("❌ Unable to get guest token.")
+              with open(f"results/{artist}/README.md", 'w') as f: f.write(f"# {artist}\n\n❌ Could not obtain access token.")
+              exit(1)
+          access_token = tokens[0]
+          print("✅ Guest token obtained")
+
+          # 2. جستجو در API
+          search_url = f"https://api.spotify.com/v1/search?q={urllib.parse.quote(query)}&type=track&limit={limit}"
+          req = urllib.request.Request(search_url, headers={'Authorization': f'Bearer {access_token}'})
+          with urllib.request.urlopen(req) as resp:
+              data = json.load(resp)
           
-          tracks = []
-          with open(f"{dir}/raw.json", 'r') as f:
-              for line in f:
-                  if line.startswith('{'):
-                      try:
-                          tracks.append(json.loads(line))
-                      except:
-                          pass
-          
+          tracks = data.get('tracks', {}).get('items', [])
           if not tracks:
               print("❌ No tracks found.")
-              with open(f"{dir}/README.md", 'w', encoding='utf-8') as f:
-                  f.write(f"# {artist}\n\n❌ No results found.")
-              exit()
-          
+              with open(f"results/{artist}/README.md", 'w') as f: f.write(f"# {artist}\n\n❌ No results.")
+              exit(0)
+
           print(f"✅ Found {len(tracks)} tracks\n")
-          
+
           all_links = []
-          for i, t in enumerate(tracks[:limit]):
-              title = t.get('title', 'Unknown')
-              track_artist = t.get('uploader', t.get('artist', t.get('channel', artist)))
-              duration = t.get('duration', 0) or 0
-              mins = int(duration // 60)
-              secs = int(duration % 60)
-              duration_str = f"{mins}:{secs:02d}"
-              url = t.get('webpage_url', t.get('url', ''))
-              thumbnail = t.get('thumbnail', t.get('thumbnails', [{}])[0].get('url', '') if t.get('thumbnails') else '')
-              
+          for i, t in enumerate(tracks):
+              name = t['name']
+              artists = ', '.join(a['name'] for a in t['artists'])
+              album = t['album']['name']
+              release = t['album']['release_date']
+              dur_ms = t['duration_ms']
+              mins = dur_ms // 60000
+              secs = (dur_ms % 60000) // 1000
+              dur = f"{mins}:{secs:02d}"
+              url = t['external_urls']['spotify']
+              cover = t['album']['images'][0]['url'] if t['album']['images'] else ''
+              popularity = t['popularity']
+
               track_info = {
-                  'index': i + 1,
-                  'title': title,
-                  'artist': track_artist,
-                  'duration': duration_str,
-                  'url': url,
-                  'thumbnail': thumbnail
+                  'index': i+1,
+                  'title': name,
+                  'artist': artists,
+                  'album': album,
+                  'release_date': release,
+                  'duration': dur,
+                  'popularity': popularity,
+                  'spotify_url': url,
+                  'cover': cover
               }
               all_links.append(track_info)
-              print(f"{i+1}. {track_artist} — {title}  [{duration_str}]")
+              print(f"{i+1}. {artists} — {name}  [{dur}]")
+              print(f"   💿 {album} | {'⭐'*(popularity//20)} {popularity}")
               print(f"   🔗 {url}\n")
-          
+
+          # ذخیره‌سازی فایل‌ها
+          dir = f"results/{artist}"
           # README.md
           md = f"<div align=\"center\">\n\n# 🎵 {artist}\n\n**{len(all_links)} tracks**\n\n</div>\n\n"
-          md += "<table>\n<tr><th>#</th><th>Cover</th><th>Track</th><th>Duration</th><th>Link</th></tr>\n"
-          links_txt = f"# {artist} — Links\n\n"
+          md += "<table>\n<tr><th>#</th><th>Cover</th><th>Track</th><th>Duration</th><th>Popularity</th><th>Link</th></tr>\n"
+          links_txt = f"# {artist} — Spotify Links\n\n"
           json_tracks = []
-          
           for t in all_links:
-              cover_html = f"<img src=\"{t['thumbnail']}\" width=\"80\" height=\"80\" style=\"border-radius:8px\">" if t.get('thumbnail') else "🎵"
-              md += f"<tr><td align=\"center\">{t['index']}</td><td align=\"center\">{cover_html}</td><td><strong>{t['artist']} — {t['title']}</strong></td><td align=\"center\"><code>{t['duration']}</code></td><td align=\"center\"><a href=\"{t['url']}\" target=\"_blank\">🔗 Open</a></td></tr>\n"
-              links_txt += f"{t['url']}\n"
+              cover_html = f"<img src=\"{t['cover']}\" width=\"80\" height=\"80\" style=\"border-radius:8px\">" if t['cover'] else "🎵"
+              md += f"<tr><td align=\"center\">{t['index']}</td><td align=\"center\">{cover_html}</td><td><strong>{t['artist']} — {t['title']}</strong></td><td align=\"center\"><code>{t['duration']}</code></td><td align=\"center\">{'⭐'*(t['popularity']//20)}</td><td align=\"center\"><a href=\"{t['spotify_url']}\" target=\"_blank\">🔗 Open</a></td></tr>\n"
+              links_txt += f"{t['spotify_url']}\n"
               json_tracks.append(t)
-          
           md += "</table>\n\n---\n\n## 📋 All Links\n\n"
           for t in all_links:
-              md += f"- **{t['index']}.** [{t['artist']} — {t['title']}]({t['url']}) `{t['duration']}`\n"
-          
+              md += f"- **{t['index']}.** [{t['artist']} — {t['title']}]({t['spotify_url']}) `{t['duration']}`\n"
+
           with open(f"{dir}/README.md", 'w', encoding='utf-8') as f: f.write(md)
           with open(f"{dir}/links.txt", 'w', encoding='utf-8') as f: f.write(links_txt)
           with open(f"{dir}/links.json", 'w', encoding='utf-8') as f:
               json.dump({'artist': artist, 'query': query, 'total': len(all_links), 'tracks': json_tracks}, f, indent=2)
-          
+
           print(f"✅ Files saved to {dir}/")
           PYEOF
 
