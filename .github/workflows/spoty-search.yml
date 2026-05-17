@@ -1,4 +1,4 @@
-name: 🎧 Spotify Search (Puppeteer Token)
+name: 🎧 Spotify Search (Embed Token)
 
 on:
   workflow_dispatch:
@@ -21,148 +21,180 @@ on:
 jobs:
   search:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     permissions:
       contents: write
 
     steps:
       - uses: actions/checkout@v5
 
-      - name: Setup Node.js & Puppeteer
-        uses: actions/setup-node@v6
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version: '24'
+          python-version: '3.12'
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq jq
-          npm init -y
-          npm install puppeteer
+      - name: Install requests
+        run: pip install requests
 
-      - name: Get Guest Token & Search
+      - name: Search Spotify & Save Results
         env:
           ARTIST: ${{ github.event.inputs.artist }}
           SONG: ${{ github.event.inputs.song }}
           LIMIT: ${{ github.event.inputs.limit }}
         run: |
           mkdir -p "results/$ARTIST"
+          python3 << 'PYEOF'
+          import os, json, re, requests, urllib.parse, random, string, sys
+
+          artist = os.environ['ARTIST'].strip()
+          song = os.environ.get('SONG', '').strip()
+          limit = int(os.environ.get('LIMIT', 10))
+          query = f"{artist} {song}" if song else artist
+
+          print(f"🎵 Spotify Search: \"{query}\"")
+
+          # لیست User-Agent های تصادفی
+          user_agents = [
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+              "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+              "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+          ]
+          headers = {"User-Agent": random.choice(user_agents)}
+
+          access_token = None
+
+          # روش ۱: Embed Token Endpoint (مقاوم‌ترین)
+          try:
+              resp = requests.get("https://open.spotify.com/embed/token", headers=headers, timeout=10)
+              if resp.status_code == 200:
+                  data = resp.json()
+                  if "accessToken" in data:
+                      access_token = data["accessToken"]
+                      print("✅ Token obtained from embed/token")
+          except Exception as e:
+              print(f"⚠️ Embed token failed: {e}")
+
+          # روش ۲: استخراج از صفحه اصلی
+          if not access_token:
+              try:
+                  resp = requests.get("https://open.spotify.com", headers=headers, timeout=10)
+                  html = resp.text
+                  # جستجوی الگوهای مختلف
+                  tokens = re.findall(r'accessToken":"([^"]+)"', html)
+                  if not tokens:
+                      tokens = re.findall(r'accessToken%22%3A%22([^"]+)%22', html)
+                  if tokens:
+                      access_token = tokens[0]
+                      print("✅ Token extracted from page script")
+                  else:
+                      # روش ۲.۱: درخواست به get_access_token
+                      resp2 = requests.get("https://open.spotify.com/get_access_token?reason=transport&productType=web_player", headers=headers, timeout=10)
+                      if resp2.status_code == 200:
+                          data2 = resp2.json()
+                          access_token = data2.get("accessToken")
+                          if access_token:
+                              print("✅ Token from get_access_token")
+              except Exception as e:
+                  print(f"⚠️ Page token extraction failed: {e}")
+
+          if not access_token:
+              print("❌ All token methods failed. Falling back to yt-dlp...")
+              # نقشه آخر: استفاده از yt-dlp برای جستجو (بدون ذخیره JSON استاندارد، اما خروجی می‌دهد)
+              import subprocess
+              cmd = [
+                  "yt-dlp", "--flat-playlist", "--dump-json", "--no-download",
+                  "--default-search", "spotify", "--max-downloads", str(limit),
+                  query
+              ]
+              result = subprocess.run(cmd, capture_output=True, text=True)
+              if result.returncode != 0 or not result.stdout.strip():
+                  print("❌ yt-dlp also failed.")
+                  with open(f"results/{artist}/README.md", 'w') as f:
+                      f.write(f"# {artist}\n\n❌ No results found.")
+                  sys.exit(0)
+              # Parse yt-dlp output
+              tracks = []
+              for line in result.stdout.strip().split('\n'):
+                  if line.startswith('{'):
+                      try: tracks.append(json.loads(line))
+                      except: pass
+              # Process tracks as below (reuse code) - but we'll do it here
+              all_links = []
+              for i, t in enumerate(tracks[:limit]):
+                  title = t.get('title', 'Unknown')
+                  artist_name = t.get('uploader', t.get('artist', artist))
+                  dur = t.get('duration', 0) or 0
+                  mins, secs = int(dur//60), int(dur%60)
+                  dur_str = f"{mins}:{secs:02d}"
+                  url = t.get('webpage_url', '')
+                  thumb = t.get('thumbnail', '')
+                  all_links.append({
+                      'index': i+1, 'title': title, 'artist': artist_name,
+                      'duration': dur_str, 'spotify_url': url, 'cover': thumb
+                  })
+              save_results(artist, query, all_links)
+              sys.exit(0)
+
+          # اگر توکن داریم، با API جستجو کن
+          search_url = f"https://api.spotify.com/v1/search?q={urllib.parse.quote(query)}&type=track&limit={limit}"
+          api_headers = {"Authorization": f"Bearer {access_token}", **headers}
+          resp = requests.get(search_url, headers=api_headers, timeout=15)
+          if resp.status_code != 200:
+              print(f"❌ API search failed: {resp.status_code}")
+              with open(f"results/{artist}/README.md", 'w') as f:
+                  f.write(f"# {artist}\n\n❌ API error {resp.status_code}")
+              sys.exit(1)
           
-          cat > get_token_and_search.js << 'SCRIPT'
-          const puppeteer = require('puppeteer');
-          const fs = require('fs');
-          const https = require('https');
+          data = resp.json()
+          items = data.get("tracks", {}).get("items", [])
+          if not items:
+              print("❌ No tracks found.")
+              with open(f"results/{artist}/README.md", 'w') as f:
+                  f.write(f"# {artist}\n\n❌ No results.")
+              sys.exit(0)
 
-          (async () => {
-            const query = process.env.ARTIST + (process.env.SONG ? ' ' + process.env.SONG : '');
-            const limit = parseInt(process.env.LIMIT) || 10;
+          all_links = []
+          for i, t in enumerate(items):
+              name = t['name']
+              artists = ', '.join(a['name'] for a in t['artists'])
+              album = t['album']['name']
+              release = t['album']['release_date']
+              dur_ms = t['duration_ms']
+              mins, secs = int(dur_ms//60000), int((dur_ms%60000)//1000)
+              dur = f"{mins}:{secs:02d}"
+              url = t['external_urls']['spotify']
+              cover = t['album']['images'][0]['url'] if t['album']['images'] else ''
+              popularity = t['popularity']
+              all_links.append({
+                  'index': i+1, 'title': name, 'artist': artists,
+                  'album': album, 'release_date': release,
+                  'duration': dur, 'popularity': popularity,
+                  'spotify_url': url, 'cover': cover
+              })
+              print(f"{i+1}. {artists} — {name}  [{dur}]")
+              print(f"   🔗 {url}\n")
 
-            console.log(`🎵 Searching: "${query}"`);
+          save_results(artist, query, all_links)
 
-            const browser = await puppeteer.launch({
-              headless: 'new',
-              args: ['--no-sandbox', '--disable-setuid-sandbox', '--autoplay-policy=no-user-gesture-required']
-            });
-            const page = await browser.newPage();
-
-            // شکار توکن از Network
-            let accessToken = null;
-            await page.setRequestInterception(true);
-            page.on('request', req => {
-              const url = req.url();
-              if (url.includes('api.spotify.com/v1') && !accessToken) {
-                const authHeader = req.headers()['authorization'];
-                if (authHeader && authHeader.startsWith('Bearer ')) {
-                  accessToken = authHeader.split(' ')[1];
-                  console.log('🎯 Token captured from network');
-                }
-              }
-              req.continue();
-            });
-
-            console.log('Opening Spotify to capture token...');
-            await page.goto('https://open.spotify.com', { waitUntil: 'networkidle2', timeout: 40000 });
-            await new Promise(r => setTimeout(r, 3000));
-
-            // اگر توکن از Network شکار نشد، از localStorage بردار
-            if (!accessToken) {
-              accessToken = await page.evaluate(() => {
-                try {
-                  const token = JSON.parse(localStorage.getItem('sp://oauth2')).accessToken;
-                  return token;
-                } catch(e) { return null; }
-              });
-              if (accessToken) console.log('🎯 Token found in localStorage');
-            }
-
-            await browser.close();
-
-            if (!accessToken) {
-              console.error('❌ Could not get token.');
-              process.exit(1);
-            }
-
-            console.log('✅ Token obtained, searching...');
-            
-            // جستجو با API
-            const searchUrl = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=${limit}`;
-            const options = { headers: { 'Authorization': `Bearer ${accessToken}` } };
-
-            https.get(searchUrl, options, (res) => {
-              let data = '';
-              res.on('data', chunk => data += chunk);
-              res.on('end', () => {
-                const result = JSON.parse(data);
-                const tracks = result.tracks?.items || [];
-                
-                if (!tracks.length) {
-                  console.log('❌ No tracks found.');
-                  process.exit(0);
-                }
-
-                console.log(`✅ Found ${tracks.length} tracks\n`);
-                
-                const allLinks = tracks.map((t, i) => ({
-                  index: i + 1,
-                  title: t.name,
-                  artist: t.artists.map(a => a.name).join(', '),
-                  album: t.album.name,
-                  release_date: t.album.release_date,
-                  duration: `${Math.floor(t.duration_ms/60000)}:${String(Math.floor((t.duration_ms%60000)/1000)).padStart(2,'0')}`,
-                  popularity: t.popularity,
-                  spotify_url: t.external_urls.spotify,
-                  cover: t.album.images[0]?.url || ''
-                }));
-
-                allLinks.forEach(t => {
-                  console.log(`${t.index}. ${t.artist} — ${t.title}  [${t.duration}]`);
-                  console.log(`   🔗 ${t.spotify_url}\n`);
-                });
-
-                // ذخیره‌سازی
-                const dir = `results/${process.env.ARTIST}`;
-                fs.mkdirSync(dir, { recursive: true });
-
-                let md = `<div align="center">\n\n# 🎵 ${process.env.ARTIST}\n\n**${allLinks.length} tracks**\n\n</div>\n\n`;
-                md += "<table>\n<tr><th>#</th><th>Cover</th><th>Track</th><th>Duration</th><th>Link</th></tr>\n";
-                let linksTxt = `# ${process.env.ARTIST}\n\n`;
-
-                allLinks.forEach(t => {
-                  const coverHtml = t.cover ? `<img src="${t.cover}" width="80" height="80" style="border-radius:8px">` : '🎵';
-                  md += `<tr><td>${t.index}</td><td>${coverHtml}</td><td><strong>${t.artist} — ${t.title}</strong></td><td><code>${t.duration}</code></td><td><a href="${t.spotify_url}">🔗 Open</a></td></tr>\n`;
-                  linksTxt += `${t.spotify_url}\n`;
-                });
-                md += "</table>";
-
-                fs.writeFileSync(`${dir}/README.md`, md);
-                fs.writeFileSync(`${dir}/links.txt`, linksTxt);
-                fs.writeFileSync(`${dir}/links.json`, JSON.stringify({ artist: process.env.ARTIST, query, total: allLinks.length, tracks: allLinks }, null, 2));
-                console.log(`✅ Files saved to ${dir}/`);
-              });
-            }).on('error', e => console.error(e));
-          })();
-          SCRIPT
-          
-          node get_token_and_search.js
+          def save_results(artist, query, tracks):
+              dir = f"results/{artist}"
+              # README.md
+              md = f"<div align=\"center\">\n\n# 🎵 {artist}\n\n**{len(tracks)} tracks**\n\n</div>\n\n"
+              md += "<table>\n<tr><th>#</th><th>Cover</th><th>Track</th><th>Duration</th><th>Link</th></tr>\n"
+              links_txt = f"# {artist}\n\n"
+              json_tracks = []
+              for t in tracks:
+                  cover_html = f"<img src=\"{t.get('cover','')}\" width=\"80\" height=\"80\" style=\"border-radius:8px\">" if t.get('cover') else "🎵"
+                  md += f"<tr><td align=\"center\">{t['index']}</td><td align=\"center\">{cover_html}</td><td><strong>{t['artist']} — {t['title']}</strong></td><td align=\"center\"><code>{t.get('duration','—')}</code></td><td align=\"center\"><a href=\"{t['spotify_url']}\" target=\"_blank\">🔗 Open</a></td></tr>\n"
+                  links_txt += f"{t['spotify_url']}\n"
+                  json_tracks.append(t)
+              md += "</table>"
+              with open(f"{dir}/README.md", 'w', encoding='utf-8') as f: f.write(md)
+              with open(f"{dir}/links.txt", 'w', encoding='utf-8') as f: f.write(links_txt)
+              with open(f"{dir}/links.json", 'w', encoding='utf-8') as f:
+                  json.dump({'artist': artist, 'query': query, 'total': len(tracks), 'tracks': json_tracks}, f, indent=2)
+              print(f"✅ Files saved to {dir}/")
+          PYEOF
 
       - name: Show links
         if: always()
